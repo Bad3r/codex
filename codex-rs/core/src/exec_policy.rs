@@ -1264,11 +1264,20 @@ async fn collect_policy_files(dir: impl AsRef<Path>) -> Result<Vec<PathBuf>, Exe
                 source,
             })?;
 
+        // Follow symlinks so linked rule files load; dangling links are skipped.
+        let is_file = if file_type.is_symlink() {
+            fs::metadata(&path)
+                .await
+                .is_ok_and(|metadata| metadata.is_file())
+        } else {
+            file_type.is_file()
+        };
+
         if path
             .extension()
             .and_then(|ext| ext.to_str())
             .is_some_and(|ext| ext == RULE_EXTENSION)
-            && file_type.is_file()
+            && is_file
         {
             policy_paths.push(path);
         }

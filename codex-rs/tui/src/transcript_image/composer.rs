@@ -45,9 +45,7 @@ impl ComposerImages {
         // Kitty can scale a nominal raster into its cell placement. Sixel needs physical pixels.
         let cell_size = terminal_cell_size()
             .or_else(|| (protocol != ImageProtocol::Sixel).then_some((8, 16)))?;
-        let background = crate::terminal_palette::default_bg()
-            .map(crate::style::user_message_bg_rgb)
-            .unwrap_or((48, 48, 48));
+        let background = crate::style::composer_bg_rgb(crate::terminal_palette::default_bg());
         if previous.as_ref().is_some_and(|old| {
             (old.protocol, old.cell_size, old.background) == (protocol, cell_size, background)
         }) {
@@ -198,4 +196,78 @@ fn visible_thumbnails(width: u16, count: usize) -> (usize, usize) {
         visible -= 1;
     }
     (visible, count - visible)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::render::highlight::current_syntax_theme;
+    use crate::render::highlight::set_syntax_theme;
+    use crate::terminal_palette::with_test_default_colors;
+    use syntect::highlighting::Color;
+    use syntect::highlighting::StyleModifier;
+    use syntect::highlighting::Theme;
+    use syntect::highlighting::ThemeItem;
+
+    #[test]
+    fn semantic_ui_image_background_resolves_without_terminal_probe() {
+        let original = current_syntax_theme();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("transparent.png");
+        RgbaImage::from_pixel(1, 1, Rgba([0, 0, 0, 0]))
+            .save(&path)
+            .unwrap();
+        for scope in ["codex.ui.prompt", "codex.ui.surface"] {
+            set_syntax_theme(Theme {
+                scopes: vec![ThemeItem {
+                    scope: scope.parse().unwrap(),
+                    style: StyleModifier {
+                        background: Some(Color {
+                            r: 36,
+                            g: 47,
+                            b: 58,
+                            a: 255,
+                        }),
+                        ..StyleModifier::default()
+                    },
+                }],
+                ..Theme::default()
+            });
+            with_test_default_colors(None, || {
+                assert_eq!(crate::terminal_palette::default_bg(), None);
+                let images = ComposerImages::for_terminal(ImageProtocol::Kitty, None).unwrap();
+                assert_eq!(images.background, (36, 47, 58));
+                assert_eq!(
+                    crate::style::composer_style().bg,
+                    Some(crate::terminal_palette::rgb_color((36, 47, 58)))
+                );
+                let tile = images.load_tile(&path).unwrap();
+                assert_eq!(tile.pixels.get_pixel(1, 1).0, [36, 47, 58, 255]);
+            });
+        }
+        set_syntax_theme(Theme::default());
+        with_test_default_colors(None, || {
+            assert_eq!(
+                ComposerImages::for_terminal(ImageProtocol::Kitty, None)
+                    .unwrap()
+                    .background,
+                (48, 48, 48)
+            );
+        });
+        with_test_default_colors(
+            crate::terminal_probe::DefaultColors {
+                fg: (255, 255, 255),
+                bg: (18, 19, 20),
+            },
+            || {
+                assert_eq!(
+                    ComposerImages::for_terminal(ImageProtocol::Kitty, None)
+                        .unwrap()
+                        .background,
+                    (46, 47, 48)
+                );
+            },
+        );
+        set_syntax_theme(original);
+    }
 }

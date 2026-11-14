@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Gate for the patch stack: formatting, a type check of codex-cli, which
-# depends on every patched crate, and a complete Cargo.lock. Runs on pull
-# requests into `patched` and on a release candidate before it is published.
+# Gate for the patch stack: formatting, a build of codex-cli, which depends on
+# every patched crate, and a complete Cargo.lock. Runs on pull requests into
+# `patched` and on a release candidate before it is published.
 set -euo pipefail
 
 cd "$(dirname "$0")/../../codex-rs"
@@ -24,8 +24,8 @@ if [[ -n ${GITHUB_ACTIONS:-} ]]; then
     build-essential pkg-config libcap-dev
   # Without arguments this installs the toolchain rust-toolchain.toml names.
   rustup toolchain install --no-self-update
-  # A type check needs neither incremental state nor debug info, and both
-  # cost disk the runner is short of.
+  # The gate needs neither incremental state nor debug info, and both cost
+  # build time and disk.
   export CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0
 fi
 
@@ -36,7 +36,8 @@ cargo fmt -- --config imports_granularity=Item --check
 # --locked fails on every one. cargo rewrites those to the workspace version
 # here; any other rewrite is a dependency change the stack did not commit, and
 # packagers vendor from the committed lockfile.
-cargo check -p codex-cli
+cargo build -p codex-cli
+cargo run -p codex-cli --bin codex -- --version
 version=$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml)
 drift=$(diff "$committed" Cargo.lock | grep '^[<>]' |
   grep -vxF -e '< version = "0.0.0"' -e "> version = \"$version\"" || true)

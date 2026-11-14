@@ -1,0 +1,113 @@
+name: Sync Fork With Upstream
+
+"on":
+  schedule:
+    - cron: "17 */8 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Merge upstream main
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/fork
+
+      # GITHUB_TOKEN cannot write workflow files, and upstream changes them
+      # often, so the merge uses a token with the Workflows permission.
+      - name: Merge upstream into main
+        env:
+          GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
+        run: |
+          # A conflict fails with HTTP 409 and leaves main untouched.
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/merge-upstream" -f branch=main >"$RUNNER_TEMP/sync.json"
+          {
+            echo "## Upstream sync"
+            echo "- result: $(jq -r '.merge_type' "$RUNNER_TEMP/sync.json")"
+            echo "- message: $(jq -r '.message' "$RUNNER_TEMP/sync.json")"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Disable workflows outside the allowlist
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: .github/fork/enforce-allowlist.sh
+
+  # The candidate's check runs third-party build scripts, so this job holds no
+  # write token and no secret.
+  gate:
+    name: Check the release candidate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    outputs:
+      decision: ${{ steps.cut.outputs.decision }}
+      tree: ${{ steps.cut.outputs.tree }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/fork
+
+      - name: Prepare the candidate
+        id: cut
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "## Release candidate" >>"$GITHUB_STEP_SUMMARY"
+          .github/fork/cut-release.sh prepare "$RUNNER_TEMP/candidate"
+
+      - name: Gate
+        if: steps.cut.outputs.decision == 'release'
+        working-directory: ${{ runner.temp }}/candidate
+        run: .github/fork/check.sh
+
+  # A fresh runner rebuilds the candidate and publishes it only when its tree
+  # is the one the gate checked.
+  release:
+    name: Publish patched release
+    needs: gate
+    if: needs.gate.outputs.decision == 'release' || needs.gate.outputs.decision == 'release-only'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      actions: write
+      contents: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/fork
+
+      - name: Prepare the candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "## Patched release" >>"$GITHUB_STEP_SUMMARY"
+          .github/fork/cut-release.sh prepare "$RUNNER_TEMP/candidate"
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUSH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
+          GATED_TREE: ${{ needs.gate.outputs.tree }}
+        run: .github/fork/cut-release.sh publish --gated-tree "$GATED_TREE" "$RUNNER_TEMP/candidate"
+
+      - name: Disable workflows outside the allowlist
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: .github/fork/enforce-allowlist.sh

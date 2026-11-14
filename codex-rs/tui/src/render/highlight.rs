@@ -360,8 +360,41 @@ fn scope_background(
     })
 }
 
-/// Query the active syntax theme for the first foreground style provided by the
-/// supplied TextMate scopes.
+thread_local! {
+    static UI_STYLES: std::cell::RefCell<(u64, std::collections::HashMap<String, Option<Style>>)> = std::cell::RefCell::default();
+}
+
+/// Semantic UI colors are optional and follow syntax-theme live previews.
+pub(crate) fn ui_style_for_scope(scope_name: &str) -> Option<Style> {
+    UI_STYLES.with_borrow_mut(|cached| {
+        let revision = syntax_theme_revision();
+        if cached.0 != revision {
+            cached.0 = revision;
+            cached.1.clear();
+        }
+        *cached
+            .1
+            .entry(scope_name.to_owned())
+            .or_insert_with(|| ui_style_for_scope_with_theme(&current_syntax_theme(), scope_name))
+    })
+}
+
+fn ui_style_for_scope_with_theme(theme: &Theme, scope_name: &str) -> Option<Style> {
+    let scope = Scope::new(scope_name).ok()?;
+    let highlighter = Highlighter::new(theme);
+    let settings = highlighter.style_mod_for_stack(&[scope]);
+    let foreground = settings.foreground.and_then(convert_syntect_color);
+    let background = settings.background.and_then(convert_syntect_color);
+    if foreground.is_none() && background.is_none() {
+        return None;
+    }
+    let mut style = Style::default();
+    style.fg = foreground;
+    style.bg = background;
+    Some(style)
+}
+
+/// Query the first explicitly scoped foreground from the active syntax theme.
 pub(crate) fn foreground_style_for_scopes(scope_names: &[&str]) -> Option<Style> {
     let theme = current_syntax_theme();
     foreground_style_for_scopes_with_theme(&theme, scope_names)
@@ -1391,6 +1424,46 @@ mod tests {
             style.fg,
             Some(crate::terminal_palette::rgb_color((10, 20, 30)))
         );
+    }
+
+    #[test]
+    fn semantic_ui_background_does_not_replace_inherited_foreground() {
+        let mut item = theme_item_with_foreground("codex.ui.prompt", (10, 20, 30));
+        item.style.background = item.style.foreground.take();
+        let theme = Theme {
+            scopes: vec![item],
+            ..Theme::default()
+        };
+        let style = ui_style_for_scope_with_theme(&theme, "codex.ui.prompt").unwrap();
+        assert_eq!(style.fg, None);
+        assert_eq!(
+            style.bg,
+            Some(crate::terminal_palette::rgb_color((10, 20, 30)))
+        );
+    }
+
+    #[test]
+    fn semantic_ui_scopes_preserve_partial_styles_and_follow_theme_changes() {
+        let original = current_syntax_theme();
+        assert_eq!(
+            ui_style_for_scope_with_theme(&Theme::default(), "codex.ui.prompt"),
+            None
+        );
+        let theme = Theme {
+            scopes: vec![theme_item_with_foreground("codex.ui.prompt", (10, 20, 30))],
+            ..Theme::default()
+        };
+        let style = ui_style_for_scope_with_theme(&theme, "codex.ui.prompt").unwrap();
+        assert_eq!(
+            style.fg,
+            Some(crate::terminal_palette::rgb_color((10, 20, 30)))
+        );
+        assert_eq!(style.bg, None);
+        set_syntax_theme(theme);
+        assert_eq!(ui_style_for_scope("codex.ui.prompt"), Some(style));
+        set_syntax_theme(Theme::default());
+        assert_eq!(ui_style_for_scope("codex.ui.prompt"), None);
+        set_syntax_theme(original);
     }
 
     #[test]

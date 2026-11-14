@@ -41,6 +41,22 @@ pub(crate) fn task_marker(unread: bool, row: Style) -> ratatui::text::Span<'stat
         StdoutColorLevel::Ansi256 => best_color(rgb),
         StdoutColorLevel::TrueColor | StdoutColorLevel::Unknown => rgb_color(rgb),
     };
+    let scope = if unread {
+        "codex.accent"
+    } else {
+        "codex.ui.muted"
+    };
+    let color = ui_style(scope)
+        .and_then(|style| style.fg)
+        .map(|color| {
+            let background = if row.add_modifier.contains(Modifier::REVERSED) {
+                row.fg
+            } else {
+                row.bg
+            };
+            readable_color_on(color, background)
+        })
+        .unwrap_or(color);
     // In reverse video the terminal paints glyphs with the background color.
     let style = if row.add_modifier.contains(Modifier::REVERSED) {
         row.bg(color)
@@ -59,7 +75,15 @@ pub(crate) enum StatusTone {
 
 /// Semantic status colors that preserve the terminal's configured palette.
 pub(crate) fn status_style(tone: StatusTone) -> Style {
-    status_style_for(tone, default_bg(), effective_stdout_color_level())
+    let scope = match tone {
+        StatusTone::Success => "codex.ui.success",
+        StatusTone::Attention => "codex.ui.warning",
+        StatusTone::Failure => "codex.ui.error",
+    };
+    themed_style(
+        scope,
+        status_style_for(tone, default_bg(), effective_stdout_color_level()),
+    )
 }
 
 fn status_style_for(
@@ -81,6 +105,42 @@ fn status_style_for(
 // Decorative table rules should remain visible without competing with cell content.
 const TABLE_SEPARATOR_FG_ALPHA: f32 = 0.20;
 
+/// Optional semantic UI scopes share the active syntax theme and its live preview.
+pub(crate) fn ui_style(scope: &str) -> Option<Style> {
+    if !matches!(
+        effective_stdout_color_level(),
+        StdoutColorLevel::TrueColor | StdoutColorLevel::Ansi256
+    ) {
+        return None;
+    }
+    let quantize = |color| match color {
+        Color::Rgb(r, g, b) => best_color((r, g, b)),
+        color => color,
+    };
+    let mut style = crate::render::highlight::ui_style_for_scope(scope)?;
+    style.fg = style.fg.map(quantize);
+    style.bg = style.bg.map(quantize);
+    Some(style)
+}
+
+fn themed_style(scope: &str, fallback: Style) -> Style {
+    ui_style(scope).map_or(fallback, |style| fallback.patch(style))
+}
+
+pub(crate) fn composer_style() -> Style {
+    themed_style("codex.ui.prompt", user_message_style())
+}
+
+pub(crate) fn composer_bg_rgb(terminal_bg: Option<(u8, u8, u8)>) -> (u8, u8, u8) {
+    let surface = ui_style("codex.ui.prompt")
+        .and_then(|style| style.bg)
+        .or_else(|| ui_style("codex.ui.surface").and_then(|style| style.bg));
+    surface
+        .and_then(|color| background_rgb(Some(color)))
+        .or_else(|| terminal_bg.map(user_message_bg_rgb))
+        .unwrap_or((48, 48, 48))
+}
+
 pub fn user_message_style() -> Style {
     user_message_style_for(default_bg())
 }
@@ -101,15 +161,17 @@ pub(crate) fn shortcut_hud_style() -> Style {
 
 /// Submitted prompts use a lighter fill than the editable composer in either theme.
 pub(crate) fn history_prompt_style() -> Style {
-    let Some(background) = default_bg() else {
-        return history_prompt_fallback(effective_stdout_color_level());
-    };
-    let (foreground, alpha) = if is_light(background) {
-        ((0, 0, 0), 0.02)
+    let fallback = if let Some(background) = default_bg() {
+        let (foreground, alpha) = if is_light(background) {
+            ((0, 0, 0), 0.02)
+        } else {
+            ((255, 255, 255), 0.16)
+        };
+        Style::default().bg(best_color(blend(foreground, background, alpha)))
     } else {
-        ((255, 255, 255), 0.16)
+        history_prompt_fallback(effective_stdout_color_level())
     };
-    Style::default().bg(best_color(blend(foreground, background, alpha)))
+    themed_style("codex.ui.history", fallback)
 }
 
 // These grays are exact entries in the xterm extended palette and have 8.4:1 contrast.
@@ -132,7 +194,10 @@ pub fn proposed_plan_style() -> Style {
 
 /// Returns a low-contrast rule style for separators within markdown tables.
 pub(crate) fn table_separator_style() -> Style {
-    table_separator_style_for(default_fg(), default_bg(), stdout_color_level())
+    themed_style(
+        "codex.ui.border",
+        table_separator_style_for(default_fg(), default_bg(), stdout_color_level()),
+    )
 }
 
 /// Returns the shared accent style for active or selected TUI controls.
@@ -221,10 +286,12 @@ pub(crate) fn secondary_text_style() -> Style {
         .map_or(Color::Reset, |(fg, bg)| {
             rgb_color(blend(fg, bg, /*alpha*/ 0.6))
         });
-    Style::default()
-        .fg(readable_color_on(preferred, /*background*/ None))
-        .not_dim()
-        .not_bold()
+    themed_style(
+        "codex.ui.muted",
+        Style::default().fg(readable_color_on(preferred, /*background*/ None)),
+    )
+    .not_dim()
+    .not_bold()
 }
 
 /// Bring a focusable surface closer to the terminal background while keeping its text readable.
@@ -241,7 +308,10 @@ pub(crate) fn quiet_workspace_style() -> Style {
 }
 
 pub(crate) fn selection_style() -> Style {
-    contrast::selection_style(default_bg(), effective_stdout_color_level())
+    let fallback = contrast::selection_style(default_bg(), effective_stdout_color_level());
+    ui_style("codex.ui.selection").map_or(fallback, |style| {
+        fallback.patch(style).bold().not_dim().not_reversed()
+    })
 }
 
 /// Strengthen a control's fill using the terminal's surface tint and readable foreground.
@@ -290,7 +360,10 @@ fn user_message_accent_color_for(
 
 /// Muted amber keeps the passive warning count visible without looking like an error.
 pub(crate) fn warning_notice_style() -> Style {
-    warning_notice_style_for(default_bg(), effective_stdout_color_level())
+    themed_style(
+        "codex.ui.warning",
+        warning_notice_style_for(default_bg(), effective_stdout_color_level()),
+    )
 }
 
 fn warning_notice_style_for(background: Option<(u8, u8, u8)>, level: StdoutColorLevel) -> Style {
@@ -310,17 +383,19 @@ pub(crate) fn footer_hint_label_style() -> Style {
 
 /// Returns the style for a user-authored message using the provided terminal background.
 pub fn user_message_style_for(terminal_bg: Option<(u8, u8, u8)>) -> Style {
-    match terminal_bg {
+    let fallback = match terminal_bg {
         Some(bg) => Style::default().bg(user_message_bg(bg)),
         None => Style::default(),
-    }
+    };
+    themed_style("codex.ui.surface", fallback)
 }
 
 pub fn proposed_plan_style_for(terminal_bg: Option<(u8, u8, u8)>) -> Style {
-    match terminal_bg {
+    let fallback = match terminal_bg {
         Some(bg) => Style::default().bg(proposed_plan_bg(bg)),
         None => Style::default(),
-    }
+    };
+    themed_style("codex.ui.plan", fallback)
 }
 
 /// Returns the shared accent style for the provided terminal background.
@@ -329,11 +404,15 @@ pub(crate) fn accent_style_for(terminal_bg: Option<(u8, u8, u8)>) -> Style {
 }
 
 fn accent_color_for(terminal_bg: Option<(u8, u8, u8)>) -> Color {
-    let preferred = if terminal_bg.is_some_and(is_light) {
-        LIGHT_BG_ACCENT_RGB
-    } else {
-        UI_ACCENT
-    };
+    let preferred = ui_style("codex.accent")
+        .and_then(|style| background_rgb(style.fg))
+        .unwrap_or_else(|| {
+            if terminal_bg.is_some_and(is_light) {
+                LIGHT_BG_ACCENT_RGB
+            } else {
+                UI_ACCENT
+            }
+        });
     contrast::foreground(preferred, terminal_bg, effective_stdout_color_level())
 }
 

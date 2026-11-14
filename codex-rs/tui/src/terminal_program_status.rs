@@ -105,12 +105,24 @@ impl ProgramStatus {
         }
     }
 
-    fn iterm_indicator(self) -> &'static str {
+    fn iterm_indicator(self) -> String {
+        let scope = match self {
+            Self::Idle | Self::Done => "codex.ui.success",
+            Self::Error => "codex.ui.error",
+            Self::Working => "codex.ui.warning",
+            Self::Blocked(_) => "codex.accent",
+        };
+        if let Some(ratatui::style::Color::Rgb(r, g, b)) =
+            crate::style::ui_style(scope).and_then(|style| style.fg)
+        {
+            return format!("#{r:02x}{g:02x}{b:02x}");
+        }
         match self {
             Self::Idle | Self::Done | Self::Error => "#00d75f",
             Self::Working => "#ff9500",
             Self::Blocked(_) => "#5f87ff",
         }
+        .to_owned()
     }
 
     fn protocol_state(self) -> &'static str {

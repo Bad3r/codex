@@ -3744,6 +3744,7 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
             "ref_id": "turn0search0",
             "url": "https://example.com/docs",
         })]),
+        output: None,
     };
 
     assert_eq!(

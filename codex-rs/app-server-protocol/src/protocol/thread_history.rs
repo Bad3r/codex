@@ -858,6 +858,7 @@ impl ThreadHistoryBuilder {
             query: String::new(),
             action: None,
             results: None,
+            output: None,
         });
         self.upsert_item_in_current_turn(item);
     }
@@ -868,6 +869,7 @@ impl ThreadHistoryBuilder {
             query: payload.query.clone(),
             action: Some(web_search_action_from_core(payload.action.clone())),
             results: payload.results.clone(),
+            output: None,
         });
         self.upsert_item_in_current_turn(item);
     }
@@ -3664,6 +3666,7 @@ mod tests {
                     "ref_id": "turn0search0",
                     "url": "https://example.com/codex",
                 })]),
+                output: None,
             })
         );
         assert_eq!(
@@ -5862,6 +5865,7 @@ mod tests {
                             queries: None,
                         }),
                         results: None,
+                        output: None,
                     }))
                 }],
                 changed_turns: Vec::new(),
@@ -6004,6 +6008,7 @@ mod tests {
                             queries: None,
                         }),
                         results: None,
+                        output: None,
                     }))
                 }],
                 changed_turns: vec![ThreadHistoryTurnMetadata {

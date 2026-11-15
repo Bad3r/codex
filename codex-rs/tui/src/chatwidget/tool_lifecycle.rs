@@ -101,6 +101,7 @@ impl ChatWidget {
         call_id: String,
         query: String,
         action: codex_app_server_protocol::WebSearchAction,
+        output: Option<String>,
     ) {
         self.flush_answer_stream_with_separator();
         let mut handled = false;
@@ -111,7 +112,7 @@ impl ChatWidget {
             .and_then(|cell| cell.as_any_mut().downcast_mut::<WebSearchCell>())
             && cell.call_id() == call_id
         {
-            cell.update(action.clone(), query.clone());
+            cell.update(action.clone(), query.clone(), output.clone());
             cell.complete();
             self.bump_active_cell_revision();
             self.flush_active_cell();
@@ -119,7 +120,9 @@ impl ChatWidget {
         }
 
         if !handled {
-            self.add_to_history(history_cell::new_web_search_call(call_id, query, action));
+            self.add_to_history(
+                history_cell::new_web_search_call(call_id, query, action).with_output(output),
+            );
         }
     }
 

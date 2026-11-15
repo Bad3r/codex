@@ -50,13 +50,14 @@ pub(super) fn cells(item: ThreadItemPayload, cwd: &AbsolutePathBuf) -> Transcrip
                 )));
             }
         },
-        ThreadItemPayload::WebSearch(item) => {
-            cells.push(Arc::new(history_cell::new_web_search_call(
+        ThreadItemPayload::WebSearch(item) => cells.push(Arc::new(
+            history_cell::new_web_search_call(
                 item.id,
                 item.query,
                 item.action.unwrap_or(WebSearchAction::Other),
-            )))
-        }
+            )
+            .with_output(item.output),
+        )),
         ThreadItemPayload::ImageView { id, path } => {
             cells.push(Arc::new(history_cell::new_view_image_tool_call(id, path)))
         }

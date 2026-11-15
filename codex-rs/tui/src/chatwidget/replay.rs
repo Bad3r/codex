@@ -407,6 +407,7 @@ impl ChatWidget {
                     item.query,
                     item.action
                         .unwrap_or(codex_app_server_protocol::WebSearchAction::Other),
+                    item.output,
                 );
             }
             ThreadItemPayload::ImageView { id, path } => {

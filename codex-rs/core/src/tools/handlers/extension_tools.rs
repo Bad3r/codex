@@ -395,6 +395,7 @@ mod tests {
                         query: String::new(),
                         action: None,
                         results: None,
+                        output: None,
                     }),
                     legacy_events: Vec::new(),
                 })
@@ -608,6 +609,7 @@ mod tests {
                 query: String::new(),
                 action: None,
                 results: None,
+                output: None,
             }
         );
     }

@@ -861,12 +861,25 @@ impl ThreadHistoryBuilder {
     }
 
     fn handle_web_search_end(&mut self, payload: &WebSearchEndEvent) {
+        // The completed item precedes this event in a live turn, and only it has the response.
+        let output = self.current_turn.as_ref().and_then(|turn| {
+            turn.items
+                .iter()
+                .rev()
+                .find_map(|item| match item {
+                    ThreadItemPayload::WebSearch(search) if search.id == payload.call_id => {
+                        Some(search.output.clone())
+                    }
+                    _ => None,
+                })
+                .flatten()
+        });
         let item = ThreadItemPayload::WebSearch(WebSearchItem {
             id: payload.call_id.clone(),
             query: payload.query.clone(),
             action: Some(web_search_action_from_core(payload.action.clone())),
             results: payload.results.clone(),
-            output: None,
+            output,
         });
         self.upsert_item_in_current_turn(item);
     }
@@ -5874,6 +5887,63 @@ mod tests {
                 removed_turn_ids: Vec::new(),
             }
         );
+    }
+
+    #[test]
+    fn web_search_end_keeps_the_response_of_the_completed_item() {
+        let turn_id = "turn-1";
+        let completed = WebSearchItem {
+            id: "search-1".into(),
+            query: "codex".into(),
+            action: Some(WebSearchAction::Search {
+                query: Some("codex".into()),
+                queries: None,
+            }),
+            results: None,
+            output: Some("Search result".into()),
+        };
+        let events = [
+            EventMsg::TurnStarted(TurnStartedEvent {
+                turn_attribution: None,
+                turn_id: turn_id.to_string(),
+                root_turn_id: None,
+                trace_id: None,
+                started_at: None,
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            }),
+            EventMsg::WebSearchBegin(WebSearchBeginEvent {
+                call_id: "search-1".into(),
+            }),
+            EventMsg::ItemCompleted(ItemCompletedEvent {
+                content_token_count: None,
+                thread_id: ThreadId::new(),
+                turn_id: turn_id.to_string(),
+                item: CoreTurnItem::Extension(CoreExtensionItem::WebSearch(completed.clone())),
+                started_at_ms: Some(0),
+                completed_at_ms: 1_000,
+            }),
+            EventMsg::WebSearchEnd(WebSearchEndEvent {
+                call_id: "search-1".into(),
+                query: "codex".into(),
+                action: CoreWebSearchAction::Search {
+                    query: Some("codex".into()),
+                    queries: None,
+                },
+                results: None,
+            }),
+        ];
+        for mode in [ThreadHistoryMode::Legacy, ThreadHistoryMode::Paginated] {
+            let mut builder = ThreadHistoryBuilder::new();
+            for event in &events {
+                builder.handle_event_for_history_mode(event, mode);
+            }
+            let turns = builder.finish();
+            assert_eq!(
+                turns[0].item_payloads().collect::<Vec<_>>(),
+                vec![&ThreadItemPayload::WebSearch(completed.clone())]
+            );
+        }
     }
 
     #[test]

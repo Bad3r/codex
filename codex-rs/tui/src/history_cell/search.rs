@@ -1,7 +1,9 @@
 //! Compact web activity summaries with complete details in the transcript and raw output.
 
+use super::activity_preview::DETAIL_PREVIEW_LINES;
 use super::*;
 use crate::line_truncation::truncate_line_with_ellipsis_if_overflow;
+use crate::terminal_hyperlinks::adaptive_wrap_hyperlink_lines;
 
 #[cfg(test)]
 #[path = "search_tests.rs"]
@@ -27,6 +29,33 @@ fn web_search_action_detail(action: &WebSearchAction) -> String {
     }
 }
 
+/// Response text as terminal cells: content-reference delimiters and control characters do not
+/// print.
+fn printable(text: &str) -> String {
+    text.chars()
+        .map(|ch| match ch {
+            '\u{e200}' => '[',
+            '\u{e202}' => ':',
+            '\u{e201}' => ']',
+            ch if ch.is_control() => ' ',
+            ch => ch,
+        })
+        .collect()
+}
+
+fn preview_line(index: usize, text: &str) -> Line<'static> {
+    // Bound allocation and grapheme scanning before clipping to display width.
+    let end = text.floor_char_boundary(16 * 1024);
+    let mut shown = printable(&text[..end]);
+    if end < text.len() {
+        shown.push('…');
+    }
+    Line::from(vec![
+        if index == 0 { "  └ " } else { "    " }.dim(),
+        shown.dim(),
+    ])
+}
+
 fn web_search_detail(action: Option<&WebSearchAction>, query: &str) -> String {
     let detail = action.map(web_search_action_detail).unwrap_or_default();
     if detail.is_empty() {
@@ -41,6 +70,8 @@ pub(crate) struct WebSearchCell {
     call_id: String,
     query: String,
     action: Option<WebSearchAction>,
+    /// Text the search returned to the model, when the item carries it.
+    output: Option<String>,
     start_time: Instant,
     completed: bool,
     animations_enabled: bool,
@@ -57,6 +88,7 @@ impl WebSearchCell {
             call_id,
             query,
             action,
+            output: None,
             start_time: Instant::now(),
             completed: false,
             animations_enabled,
@@ -67,9 +99,20 @@ impl WebSearchCell {
         &self.call_id
     }
 
-    pub(crate) fn update(&mut self, action: WebSearchAction, query: String) {
+    pub(crate) fn with_output(mut self, output: Option<String>) -> Self {
+        self.output = output;
+        self
+    }
+
+    pub(crate) fn update(
+        &mut self,
+        action: WebSearchAction,
+        query: String,
+        output: Option<String>,
+    ) {
         self.action = Some(action);
         self.query = query;
+        self.output = output;
     }
 
     pub(crate) fn complete(&mut self) {
@@ -122,14 +165,8 @@ impl WebSearchCell {
         }
         line
     }
-}
 
-impl HistoryCell for WebSearchCell {
-    fn tool_call_labels(&self) -> Vec<String> {
-        vec![self.summary().to_string()]
-    }
-
-    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+    fn header(&self) -> Line<'static> {
         let bullet = if self.completed {
             "•".dim()
         } else {
@@ -146,23 +183,84 @@ impl HistoryCell for WebSearchCell {
             span.content = span.content.replace(['\n', '\r', '\t'], " ").into();
         }
         line.extend(summary);
-        vec![truncate_line_with_ellipsis_if_overflow(
-            line,
-            width as usize,
-        )]
+        line
+    }
+
+    fn output(&self) -> Option<&str> {
+        self.output
+            .as_deref()
+            .filter(|output| !output.trim().is_empty())
+    }
+}
+
+impl HistoryCell for WebSearchCell {
+    fn tool_call_labels(&self) -> Vec<String> {
+        vec![self.summary().to_string()]
+    }
+
+    fn activity_ids(&self) -> Vec<String> {
+        // A search without a response has nothing to disclose and keeps a plain row.
+        self.output()
+            .map(|_| format!("web:{}", self.call_id))
+            .into_iter()
+            .collect()
+    }
+
+    fn activity_disclosure(&self, width: u16) -> Option<ActivityDisclosure> {
+        let output = self.output()?;
+        let overflows = |line: Line<'_>| line.width() > usize::from(width);
+        let clipped = output
+            .lines()
+            .take(DETAIL_PREVIEW_LINES)
+            .filter(|text| overflows(preview_line(/*index*/ 0, text)))
+            .count();
+        let hidden = output.lines().count().saturating_sub(DETAIL_PREVIEW_LINES) + clipped;
+        if hidden > 0 {
+            return Some(ActivityDisclosure::OutputLines(hidden));
+        }
+        overflows(self.header()).then_some(ActivityDisclosure::Generic)
+    }
+
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let preview = self
+            .output()
+            .into_iter()
+            .flat_map(str::lines)
+            .take(DETAIL_PREVIEW_LINES)
+            .enumerate()
+            .map(|(index, text)| preview_line(index, text));
+        std::iter::once(self.header())
+            .chain(preview)
+            .map(|line| truncate_line_with_ellipsis_if_overflow(line, width as usize))
+            .collect()
     }
 
     fn transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
-        PrefixedWrappedHistoryCell::new(self.summary(), vec!["• ".dim()], "  ").display_lines(width)
+        visible_lines(self.transcript_hyperlink_lines(width))
     }
 
     fn transcript_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine> {
-        PrefixedWrappedHistoryCell::new(self.summary(), vec!["• ".dim()], "  ")
-            .display_hyperlink_lines(width)
+        let mut lines = PrefixedWrappedHistoryCell::new(self.summary(), vec!["• ".dim()], "  ")
+            .display_hyperlink_lines(width);
+        if let Some(output) = self.output() {
+            let response = output
+                .lines()
+                .map(|text| Line::from(printable(text)))
+                .collect();
+            lines.extend(adaptive_wrap_hyperlink_lines(
+                &plain_hyperlink_lines(response),
+                RtOptions::new(usize::from(width).max(/*other*/ 1))
+                    .initial_indent("  └ ".dim().into())
+                    .subsequent_indent("    ".into()),
+            ));
+        }
+        lines
     }
 
     fn raw_lines(&self) -> Vec<Line<'static>> {
-        plain_lines(vec![self.summary()])
+        let mut lines = vec![self.summary()];
+        lines.extend(self.output().into_iter().flat_map(raw_lines_from_source));
+        plain_lines(lines)
     }
 }
 

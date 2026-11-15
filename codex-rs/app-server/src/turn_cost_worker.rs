@@ -113,8 +113,11 @@ impl TurnCostWorker {
             config.otel.metrics_exporter,
             OtelExporterKind::OtlpHttp { .. } | OtelExporterKind::OtlpGrpc { .. }
         );
+        // Polling sends turn IDs to the provider's usage endpoint, so it honors
+        // the analytics opt-out even when the exporters are local collectors.
         if !(has_otel_log_exporter || has_otel_metrics_exporter)
             || config.model_provider.is_amazon_bedrock()
+            || config.analytics_enabled == Some(false)
         {
             return None;
         }

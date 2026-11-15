@@ -20,6 +20,13 @@ pub struct WebSearchItem {
     /// result fields and result types can pass through without a Codex release.
     #[serde(default)]
     pub results: Option<Vec<JsonValue>>,
+    /// Text the standalone web search returned to the model, or its error.
+    ///
+    /// Not part of the published app-server schema.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    #[ts(skip)]
+    pub output: Option<String>,
 }
 
 // App-server-facing description of the action performed by standalone web search.

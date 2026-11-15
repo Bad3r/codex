@@ -233,6 +233,7 @@ fn web_search_item_preserves_stable_wire_shape() {
             queries: None,
         }),
         results: None,
+        output: None,
     });
     let value = serde_json::to_value(&item).expect("serialize extension item");
 

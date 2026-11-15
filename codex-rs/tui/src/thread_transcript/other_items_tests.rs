@@ -148,6 +148,7 @@ fn tool_and_notice_projection_uses_normal_transcript_presentation() {
                 pattern: Some("pagination".to_string()),
             }),
             results: None,
+            output: None,
         }),
         ThreadItemPayload::ImageView {
             id: "view-1".to_string(),

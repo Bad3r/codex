@@ -1102,6 +1102,7 @@ impl From<CoreTurnItem> for ThreadItemPayload {
                 query: search.query,
                 action: Some(web_search_action_from_core(search.action)),
                 results: search.results,
+                output: None,
             }),
             CoreTurnItem::ImageView(image) => Self::ImageView {
                 id: image.id,

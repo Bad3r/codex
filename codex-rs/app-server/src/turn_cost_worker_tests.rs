@@ -62,6 +62,30 @@ async fn worker_starts_with_otlp_metrics_exporter_without_log_exporter() {
 }
 
 #[tokio::test]
+async fn worker_does_not_start_when_analytics_disabled() {
+    let codex_home = TempDir::new().expect("temporary Codex home");
+    let mut config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .build()
+        .await
+        .expect("test config");
+    config.analytics_enabled = Some(false);
+    config.otel.exporter = OtelExporterKind::OtlpGrpc {
+        endpoint: "http://localhost:4317".to_string(),
+        headers: HashMap::new(),
+        tls: None,
+    };
+    config.otel.metrics_exporter = OtelExporterKind::OtlpGrpc {
+        endpoint: "http://localhost:4317".to_string(),
+        headers: HashMap::new(),
+        tls: None,
+    };
+    let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("sk-test"));
+
+    assert!(TurnCostWorker::spawn(Arc::new(config), auth_manager, /*runtime_auth*/ None).is_none());
+}
+
+#[tokio::test]
 async fn handle_observes_only_matching_model_provider() {
     let codex_home = TempDir::new().expect("temporary Codex home");
     let mut config = ConfigBuilder::default()

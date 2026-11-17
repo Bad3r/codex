@@ -116,7 +116,7 @@ use codex_protocol::user_input::UserInput;
 #[derive(Debug, Parser)]
 #[clap(
     author,
-    version,
+    version = env!("CODEX_CLI_VERSION"),
     // If a sub‑command is given, ignore requirements of the default args.
     subcommand_negates_reqs = true,
     // The executable is sometimes invoked via a platform‑specific name like

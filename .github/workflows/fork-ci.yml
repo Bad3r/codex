@@ -20,6 +20,18 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+          path: candidate
+
+      # Restores what the release gate in sync-upstream.yml saves; it builds
+      # in the same candidate/codex-rs. A pull request saves nothing, since its
+      # entries would be visible to it alone and crowd out the gate's.
+      - name: Restore the Cargo build
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: candidate/codex-rs -> target
+          shared-key: codex-cli
+          save-if: false
 
       - name: Check
+        working-directory: candidate
         run: .github/fork/check.sh

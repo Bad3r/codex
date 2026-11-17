@@ -68,21 +68,23 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           echo "## Release candidate" >>"$GITHUB_STEP_SUMMARY"
-          .github/fork/cut-release.sh prepare "$RUNNER_TEMP/candidate"
+          .github/fork/cut-release.sh prepare "$GITHUB_WORKSPACE/candidate"
 
       # A cold build of codex-cli takes most of the gate. The key covers
       # Cargo.lock and rust-toolchain.toml, so a release that changes only the
-      # stack reuses the dependencies of the last one.
+      # stack reuses the dependencies of the last one. An entry restores only
+      # at the paths it was saved from, so fork-ci.yml builds in the same
+      # candidate/codex-rs.
       - name: Cache the Cargo build
         if: steps.cut.outputs.decision == 'release'
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          workspaces: ${{ runner.temp }}/candidate/codex-rs -> target
+          workspaces: candidate/codex-rs -> target
           shared-key: codex-cli
 
       - name: Gate
         if: steps.cut.outputs.decision == 'release'
-        working-directory: ${{ runner.temp }}/candidate
+        working-directory: candidate
         run: .github/fork/check.sh
 
   # A fresh runner rebuilds the candidate and publishes it only when its tree

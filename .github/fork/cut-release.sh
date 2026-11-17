@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Rebuilds the patch stack of the `patched` branch on the newest stable
-# upstream release and publishes it as patched-v<version>-r<N>.
+# Rebuilds the patch stack of the `patched` branch on the newest upstream
+# release, prereleases included, and publishes it as
+# patched-v<version>-r<N>.
 #
 #   cut-release.sh prepare [--onto <upstream tag>] <dir>
 #   cut-release.sh publish [--gated-tree <tree>] <dir>
@@ -22,7 +23,7 @@ UPSTREAM_REPO=${UPSTREAM_REPO:-openai/codex}
 FORK_URL=${FORK_URL:-https://github.com/$FORK_REPO.git}
 UPSTREAM_URL=${UPSTREAM_URL:-https://github.com/$UPSTREAM_REPO.git}
 BRANCH=patched
-STABLE_VERSION='^[0-9]+\.[0-9]+\.[0-9]+$'
+RELEASE_VERSION='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
 # Paths that decide whether two trees are the same release.
 SOURCE=(. ':(exclude).github')
 
@@ -61,21 +62,26 @@ release_exists() {
   release_query "$FORK_REPO" "$1" .id
 }
 
-# Sets `new` to the highest stable upstream version with a published release.
-# The versions come from the tags: the releases listing is paginated and
-# times out on upstream's pages.
-latest_upstream_stable() {
+# Sorts versions in semver order: a prerelease sorts before its release.
+sort_versions() {
+  sed 's/-/~/' | sort -V "$@" | sed 's/~/-/'
+}
+
+# Sets `new` to the highest upstream version, prereleases included, with a
+# published release. The versions come from the tags: the releases listing is
+# paginated and times out on upstream's pages.
+latest_upstream_release() {
   local tags versions version
   tags=$(git ls-remote --tags "$UPSTREAM_URL" 'refs/tags/rust-v*')
   versions=$(awk '{ sub("^refs/tags/rust-v", "", $2); print $2 }' <<<"$tags" |
-    grep -E "$STABLE_VERSION" | sort -rV) || die "no stable tag in $UPSTREAM_REPO"
+    grep -E "$RELEASE_VERSION" | sort_versions -r) || die "no release tag in $UPSTREAM_REPO"
   for version in $versions; do
-    if release_query "$UPSTREAM_REPO" "rust-v$version" '.draft or .prerelease' && [[ $reply == false ]]; then
+    if release_query "$UPSTREAM_REPO" "rust-v$version" .draft && [[ $reply == false ]]; then
       new=$version
       return
     fi
   done
-  die "no stable release in $UPSTREAM_REPO"
+  die "no published release in $UPSTREAM_REPO"
 }
 
 workspace_version() {
@@ -143,7 +149,7 @@ cmd_prepare() {
   if [[ -n $onto ]]; then
     new=${onto#rust-v}
   else
-    latest_upstream_stable
+    latest_upstream_release
   fi
   last=$(highest_revision "$new" <<<"$refs")
   if [[ -n $last ]]; then
@@ -176,7 +182,7 @@ cmd_prepare() {
 
   if [[ $new == "$cur" ]]; then
     git checkout --quiet --detach "origin/$BRANCH"
-  elif [[ $(printf '%s\n' "$cur" "$new" | sort -V | tail -n 1) != "$new" ]]; then
+  elif [[ $(printf '%s\n' "$cur" "$new" | sort_versions | tail -n 1) != "$new" ]]; then
     die "upstream version $new is older than $cur on $BRANCH"
   else
     git checkout --quiet --detach "$onto_commit"
@@ -234,7 +240,7 @@ cmd_publish() {
   source .git/cut-release.env
   [[ $decision == release || $decision == release-only ]] ||
     die "nothing to publish (decision: $decision)"
-  [[ $version =~ $STABLE_VERSION ]] || die "$version is not a stable version"
+  [[ $version =~ $RELEASE_VERSION ]] || die "$version is not a release version"
   if ((gated)) && [[ $tree != "$gated_tree" ]]; then
     die "the candidate tree $tree is not the gated tree $gated_tree"
   fi

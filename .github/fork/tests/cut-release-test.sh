@@ -28,9 +28,9 @@ if [[ $1 == api && -e $FAKE/outage ]]; then
 fi
 case "$1 $2" in
 "api repos/up/codex/releases/tags/"*)
-  if grep -qx "${2##*/}" "$FAKE/prerelease"; then
+  if grep -qx "${2##*/}" "$FAKE/draft"; then
     echo true
-  elif grep -qx "${2##*/}" "$FAKE/stable"; then
+  elif grep -qx "${2##*/}" "$FAKE/released"; then
     echo false
   else
     missing
@@ -98,13 +98,14 @@ git -C "$work/up" commit --quiet -m initial
 git init --quiet --bare "$work/upstream.git"
 git -C "$work/up" push --quiet "$UPSTREAM_URL" main
 upstream_release 0.1.0
-# Tags that are released upstream and are not stable codex versions.
+# Tags that are not codex versions, are drafts, or have no release.
 git -C "$work/up" tag rusty-v8-v150.0.0
 git -C "$work/up" tag rust-v9.0.0-alpha.1
-git -C "$work/up" push --quiet "$UPSTREAM_URL" rusty-v8-v150.0.0 rust-v9.0.0-alpha.1
+git -C "$work/up" tag rust-v8.0.0
+git -C "$work/up" push --quiet "$UPSTREAM_URL" rusty-v8-v150.0.0 rust-v9.0.0-alpha.1 rust-v8.0.0
 git clone --quiet --bare --no-tags "$UPSTREAM_URL" "$work/fork.git"
-printf 'rust-v0.1.0\nrusty-v8-v150.0.0\nrust-v9.0.0-alpha.1\n' >"$FAKE/stable"
-: >"$FAKE/prerelease"
+printf 'rust-v0.1.0\nrusty-v8-v150.0.0\n' >"$FAKE/released"
+echo rust-v9.0.0-alpha.1 >"$FAKE/draft"
 
 prepare none "no patched branch"
 
@@ -130,7 +131,7 @@ prepare none "is released as patched-v0.1.0-r1"
 
 # An API failure is not read as a missing release.
 touch "$FAKE/outage"
-prepare fail "looking up the release of rust-v0.1.0"
+prepare fail "looking up the release of rust-v9.0.0-alpha.1"
 rm "$FAKE/outage"
 
 echo 'true # changed' >"$dev/.github/fork/check.sh"
@@ -162,7 +163,7 @@ set_line "$work/up" a.rs 2 upstream-two
 git -C "$work/up" commit --quiet -am "upstream change"
 git -C "$work/up" push --quiet "$UPSTREAM_URL" main
 upstream_release 0.2.0
-echo rust-v0.2.0 >>"$FAKE/stable"
+echo rust-v0.2.0 >>"$FAKE/released"
 prepare release "patched-v0.2.0-r1 from rust-v0.2.0"
 
 # The forced move is refused when the branch changed after prepare.
@@ -214,19 +215,27 @@ if "$script" publish "$dir" >/dev/null 2>&1; then
   fail "a rehearsal was published"
 fi
 
-# A release that changes a patched line.
+# A prerelease with a release is published like a stable release.
+echo rust-v0.3.0-alpha.1 >>"$FAKE/released"
+prepare release "patched-v0.3.0-alpha.1-r1 from rust-v0.3.0-alpha.1"
+"$script" publish "$dir" >/dev/null
+[[ $(fork_ref patched-v0.3.0-alpha.1-r1) == "$(fork_ref patched)" ]] || fail "alpha r1 is not the patched tip"
+[[ -e $FAKE/releases/patched-v0.3.0-alpha.1-r1 ]] || fail "alpha r1 has no release"
+prepare none "is released as patched-v0.3.0-alpha.1-r1"
+
+# A release sorts after its prereleases; this one changes a patched line.
 set_line "$work/up" a.rs 15 upstream-fifteen
 git -C "$work/up" commit --quiet -am "upstream rewrites line 15"
 upstream_release 0.3.0
-echo rust-v0.3.0 >>"$FAKE/stable"
+echo rust-v0.3.0 >>"$FAKE/released"
 prepare fail "patch one\` conflicts with rust-v0.3.0 in: codex-rs/src/a.rs"
 
-# 0.3.0 and 0.2.0 have no release and 0.2.1 is a prerelease.
-echo rust-v0.1.0 >"$FAKE/stable"
-echo rust-v0.2.1 >"$FAKE/prerelease"
-prepare fail "upstream version 0.1.0 is older than 0.2.0"
+# 0.3.0 is a draft and only 0.1.0 has a release.
+echo rust-v0.3.0 >"$FAKE/draft"
+echo rust-v0.1.0 >"$FAKE/released"
+prepare fail "upstream version 0.1.0 is older than 0.3.0-alpha.1"
 
-printf 'rust-v0.2.0\n' >"$FAKE/stable"
+printf 'rust-v0.2.0\n' >"$FAKE/released"
 git -C "$dev" fetch --quiet origin
 git -C "$dev" reset --quiet --hard origin/patched
 git -C "$dev" checkout --quiet -b side HEAD~1

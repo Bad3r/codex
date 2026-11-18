@@ -30,6 +30,15 @@ struct RolloutAuditFile {
     key: PathBuf,
     archived: bool,
     thread_id: String,
+    /// Differs from `thread_id` on the rollouts `thread/revert` adds to a thread; `None` when the
+    /// file name is not canonical.
+    rollout_id: Option<String>,
+}
+
+impl RolloutAuditFile {
+    fn rollout_id_or_thread_id(&self) -> &str {
+        self.rollout_id.as_deref().unwrap_or(&self.thread_id)
+    }
 }
 
 #[derive(Default)]
@@ -236,8 +245,19 @@ fn parity_check_from_scan_and_rows(
             .push(row);
     }
 
-    let missing_active = missing_rollout_paths(&scan.files, &rows_by_key, /*archived*/ false);
-    let missing_archived = missing_rollout_paths(&scan.files, &rows_by_key, /*archived*/ true);
+    let unselected_rollouts = unselected_reverted_rollouts(&scan.files, &rows_by_key);
+    let missing_active = missing_rollout_paths(
+        &scan.files,
+        &rows_by_key,
+        &unselected_rollouts,
+        /*archived*/ false,
+    );
+    let missing_archived = missing_rollout_paths(
+        &scan.files,
+        &rows_by_key,
+        &unselected_rollouts,
+        /*archived*/ true,
+    );
     let scan_complete = !scan.reached_scan_cap;
     let stale_rows = if scan_complete {
         rows.iter()
@@ -284,6 +304,10 @@ fn parity_check_from_scan_and_rows(
         format!(
             "rollout DB missing archived rows: {}",
             missing_archived.len()
+        ),
+        format!(
+            "rollout DB unselected reverted rollouts: {}",
+            unselected_rollouts.len()
         ),
         format!(
             "rollout DB stale rows: {}",
@@ -412,7 +436,7 @@ fn parity_check_from_scan_and_rows(
                 duplicate_rollout_thread_ids.len(),
                 duplicate_db_paths.len()
             ))
-            .expected("one rollout path and thread id per thread")
+            .expected("one rollout path per thread and one file per rollout id")
             .remedy("Attach the doctor report to a bug report so support can inspect samples."),
         );
     }
@@ -513,11 +537,14 @@ async fn scan_rollout_root(root: &Path, archived: bool, scan: &mut RolloutScan) 
                     continue;
                 }
             };
+            let rollout_id =
+                codex_rollout::rollout_id_from_path(&logical_path).map(|id| id.to_string());
             scan.files.push(RolloutAuditFile {
                 key,
                 path,
                 archived,
                 thread_id,
+                rollout_id,
             });
         }
     }
@@ -615,11 +642,49 @@ fn archived_from_rollout_path(codex_home: &Path, path: &Path) -> Option<bool> {
 fn missing_rollout_paths<'a>(
     files: &'a [RolloutAuditFile],
     rows_by_key: &HashMap<PathBuf, Vec<&ThreadStateAuditRow>>,
+    unselected_rollouts: &HashSet<&Path>,
     archived: bool,
 ) -> Vec<&'a Path> {
     files
         .iter()
-        .filter(|file| file.archived == archived && !has_matching_thread_row(file, rows_by_key))
+        .filter(|file| {
+            file.archived == archived
+                && !has_matching_thread_row(file, rows_by_key)
+                && !unselected_rollouts.contains(file.path.as_path())
+        })
+        .map(|file| file.path.as_path())
+        .collect()
+}
+
+/// Rollout files a reverted thread keeps beside the one its state DB row selects.
+///
+/// `thread/revert` switches a thread to a new rollout file with its own rollout ID and leaves the
+/// earlier files in place as immutable history, so those files have no row of their own. A file
+/// that repeats the selected rollout ID is a copy, not a revert, and stays unmatched.
+fn unselected_reverted_rollouts<'a>(
+    files: &'a [RolloutAuditFile],
+    rows_by_key: &HashMap<PathBuf, Vec<&ThreadStateAuditRow>>,
+) -> HashSet<&'a Path> {
+    let mut selected_rollout_ids: HashMap<&str, HashSet<&str>> = HashMap::new();
+    for file in files {
+        if has_matching_thread_row(file, rows_by_key) {
+            selected_rollout_ids
+                .entry(file.thread_id.as_str())
+                .or_default()
+                .insert(file.rollout_id_or_thread_id());
+        }
+    }
+    files
+        .iter()
+        .filter(|file| {
+            let Some(rollout_id) = file.rollout_id.as_deref() else {
+                return false;
+            };
+            !has_matching_thread_row(file, rows_by_key)
+                && selected_rollout_ids
+                    .get(file.thread_id.as_str())
+                    .is_some_and(|selected| !selected.contains(rollout_id))
+        })
         .map(|file| file.path.as_path())
         .collect()
 }
@@ -634,12 +699,14 @@ fn has_matching_thread_row(
     rows.iter().any(|row| row.id == file.thread_id.as_str())
 }
 
+/// Thread IDs with several files for one rollout ID; a reverted thread's distinct rollouts do
+/// not count.
 fn duplicate_rollout_thread_ids(files: &[RolloutAuditFile]) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut duplicates = HashSet::new();
-    for thread_id in files.iter().map(|file| file.thread_id.as_str()) {
-        if !seen.insert(thread_id) {
-            duplicates.insert(thread_id.to_string());
+    for file in files {
+        if !seen.insert((file.thread_id.as_str(), file.rollout_id_or_thread_id())) {
+            duplicates.insert(file.thread_id.clone());
         }
     }
     let mut duplicates = duplicates.into_iter().collect::<Vec<_>>();
@@ -850,6 +917,85 @@ mod tests {
             .find_map(|detail| detail.strip_prefix("rollout DB missing active sample: "))
             .expect("missing active sample");
         assert_eq!(Path::new(missing_sample), missing_path.as_path());
+    }
+
+    #[tokio::test]
+    async fn thread_inventory_check_accepts_reverted_thread_rollouts() {
+        let fixture = Fixture::new().await;
+        let thread_id = "00000000-0000-0000-0000-000000000001";
+        fixture.write_rollout(/*archived*/ false, "2025-01-02T10-00-00", thread_id);
+        let reverted_path = fixture.write_reverted_rollout(
+            "2025-01-02T11-00-00",
+            thread_id,
+            "00000000-0000-0000-0000-000000000002",
+        );
+        compress_rollout(&reverted_path);
+        fixture
+            .insert_thread_row(thread_id, reverted_path.as_path(), /*archived*/ false)
+            .await;
+
+        let check = thread_inventory_check_for_roots(
+            fixture.codex_home.path(),
+            &fixture.sqlite(),
+            "test-provider",
+        )
+        .await;
+
+        assert_eq!(check.status, CheckStatus::Ok);
+        assert_detail(&check, "rollout DB active files", "2");
+        assert_detail(&check, "rollout DB missing active rows", "0");
+        assert_detail(&check, "rollout DB unselected reverted rollouts", "1");
+        assert_detail(&check, "rollout DB stale rows", "0");
+        assert_detail(&check, "rollout DB duplicate rollout thread ids", "0");
+    }
+
+    #[tokio::test]
+    async fn thread_inventory_check_warns_for_reverted_thread_without_db_row() {
+        let fixture = Fixture::new().await;
+        let thread_id = "00000000-0000-0000-0000-000000000001";
+        fixture.write_rollout(/*archived*/ false, "2025-01-02T10-00-00", thread_id);
+        fixture.write_reverted_rollout(
+            "2025-01-02T11-00-00",
+            thread_id,
+            "00000000-0000-0000-0000-000000000002",
+        );
+
+        let check = thread_inventory_check_for_roots(
+            fixture.codex_home.path(),
+            &fixture.sqlite(),
+            "test-provider",
+        )
+        .await;
+
+        assert_eq!(check.status, CheckStatus::Warning);
+        assert_detail(&check, "rollout DB missing active rows", "2");
+        assert_detail(&check, "rollout DB unselected reverted rollouts", "0");
+        assert_detail(&check, "rollout DB duplicate rollout thread ids", "0");
+    }
+
+    #[tokio::test]
+    async fn thread_inventory_check_warns_for_copied_rollout() {
+        let fixture = Fixture::new().await;
+        let thread_id = "00000000-0000-0000-0000-000000000001";
+        let active_path =
+            fixture.write_rollout(/*archived*/ false, "2025-01-02T10-00-00", thread_id);
+        fixture.write_rollout(/*archived*/ true, "2025-01-02T10-00-00", thread_id);
+        fixture
+            .insert_thread_row(thread_id, active_path.as_path(), /*archived*/ false)
+            .await;
+
+        let check = thread_inventory_check_for_roots(
+            fixture.codex_home.path(),
+            &fixture.sqlite(),
+            "test-provider",
+        )
+        .await;
+
+        assert_eq!(check.status, CheckStatus::Warning);
+        assert_detail(&check, "rollout DB missing active rows", "0");
+        assert_detail(&check, "rollout DB missing archived rows", "1");
+        assert_detail(&check, "rollout DB unselected reverted rollouts", "0");
+        assert_detail(&check, "rollout DB duplicate rollout thread ids", "1");
     }
 
     #[tokio::test]
@@ -1326,8 +1472,30 @@ mod tests {
             } else {
                 self.codex_home.path().join("sessions/2025/01/02")
             };
-            std::fs::create_dir_all(&root).expect("rollout dir");
-            let path = root.join(format!("rollout-{timestamp}-{thread_id}.jsonl"));
+            self.write_rollout_file(
+                root.join(format!("rollout-{timestamp}-{thread_id}.jsonl")),
+                timestamp,
+                thread_id,
+            )
+        }
+
+        fn write_reverted_rollout(
+            &self,
+            timestamp: &str,
+            thread_id: &str,
+            rollout_id: &str,
+        ) -> PathBuf {
+            self.write_rollout_file(
+                self.codex_home.path().join(format!(
+                    "sessions/2025/01/02/rollout-{timestamp}-{thread_id}_{rollout_id}.jsonl"
+                )),
+                timestamp,
+                thread_id,
+            )
+        }
+
+        fn write_rollout_file(&self, path: PathBuf, timestamp: &str, thread_id: &str) -> PathBuf {
+            std::fs::create_dir_all(path.parent().expect("rollout parent")).expect("rollout dir");
             let parsed_thread_id = ThreadId::from_string(thread_id).expect("thread id");
             let rollout_line = RolloutLine {
                 timestamp: timestamp.to_string(),

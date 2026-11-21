@@ -24,6 +24,22 @@ impl ImageSearchOutput {
     }
 }
 
+impl ImageSearchOutput {
+    /// Returns the answer as text for the turn item: its text, with a marker
+    /// where each image goes, so that no image data lands in a transcript.
+    pub(crate) fn display_text(&self) -> String {
+        self.items
+            .iter()
+            .map(|item| match item {
+                FunctionCallOutputContentItem::InputText { text } => text.as_str(),
+                FunctionCallOutputContentItem::InputImage { .. } => "[image]",
+                FunctionCallOutputContentItem::InputAudio { .. }
+                | FunctionCallOutputContentItem::EncryptedContent { .. } => "",
+            })
+            .collect()
+    }
+}
+
 /// What `web.run` resolves to in Code Mode when a local command answers it: the
 /// text as before, or the parts of an answer with images.
 pub(crate) fn code_mode_result_schema() -> JsonValue {

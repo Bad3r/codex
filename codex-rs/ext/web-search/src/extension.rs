@@ -23,6 +23,7 @@ use codex_model_provider::WorkspaceRoutingContext;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_protocol::config_types::WebSearchContextSize;
 use codex_protocol::config_types::WebSearchMode;
+use codex_protocol::openai_models::InputModality;
 use codex_protocol::openai_models::ModelInfo;
 
 use crate::schema::LITERATURE_SEARCH_QUERY;
@@ -160,6 +161,9 @@ impl ToolContributor for WebSearchExtension {
                     .iter()
                     .any(|tool| tool == LITERATURE_SEARCH_QUERY)
             }),
+            supports_image_input: step_store
+                .get::<ModelInfo>()
+                .is_some_and(|model| model.input_modalities.contains(&InputModality::Image)),
             originator: thread_store
                 .get::<ThreadOriginator>()
                 .map(|originator| originator.0.clone()),

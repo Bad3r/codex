@@ -64,8 +64,9 @@ const MAX_SEARCH_ERROR_BYTES: usize = 1024;
 // reads the SearchRequest JSON on stdin and prints a SearchResponse.
 const WEB_RUN_COMMAND_ENV: &str = "CODEX_WEB_RUN_COMMAND";
 const WEB_RUN_COMMAND_TIMEOUT: Duration = Duration::from_secs(180);
-// Set for the local command: its response may carry `content`, the items given
-// to the model in place of `output`, so that an answer can include images.
+// Set for the local command when the model takes images: its response may then
+// carry `content`, the items given to the model in place of `output`, so that an
+// answer can include images.
 const WEB_RUN_IMAGES_ENV: &str = "CODEX_WEB_RUN_IMAGES";
 
 fn local_command() -> Option<OsString> {
@@ -79,6 +80,7 @@ pub(crate) struct WebSearchTool {
     pub(crate) workspace_routing: Arc<WorkspaceRoutingContext>,
     pub(crate) settings: SearchSettings,
     pub(crate) supports_literature_search: bool,
+    pub(crate) supports_image_input: bool,
     pub(crate) originator: Option<String>,
 }
 
@@ -103,8 +105,10 @@ impl<'call> ToolExecutor<ToolCall<'call>> for WebSearchTool {
                 description: WEB_RUN_DESCRIPTION.to_string(),
                 strict: false,
                 parameters,
-                // Only a local command's answer can be anything but text.
-                output_schema: local_command().map(|_| code_mode_result_schema().into()),
+                // Only a local command's answer to a model that takes images can
+                // be anything but text.
+                output_schema: (self.supports_image_input && local_command().is_some())
+                    .then(|| code_mode_result_schema().into()),
                 defer_loading: None,
             })],
         })
@@ -204,7 +208,9 @@ impl WebSearchTool {
             ))
             .await;
         let searched = match (&local_command, &client) {
-            (Some(command), _) => run_local_search(command, &request).await,
+            (Some(command), _) => {
+                run_local_search(command, &request, self.supports_image_input).await
+            }
             (None, Some(client)) => client
                 .search(&request, extra_headers)
                 .await
@@ -223,6 +229,7 @@ impl WebSearchTool {
             let payload_bytes = i64::try_from(payload.len()).unwrap_or(i64::MAX);
             let _ = metrics.histogram(RESULTS_PAYLOAD_BYTES_METRIC, payload_bytes, &[]);
         }
+        let (output, shown) = search_output(output, content, self.supports_image_input);
         let legacy_action = match &command_action {
             WebSearchAction::Search { query, queries } => CoreWebSearchAction::Search {
                 query: query.clone(),
@@ -243,9 +250,7 @@ impl WebSearchTool {
                     query: query.clone(),
                     action: Some(command_action),
                     results: results.clone(),
-                    output: Some(match &output {
-                        Ok(text) | Err(text) => text.clone(),
-                    }),
+                    output: Some(shown),
                 },
                 EventMsg::WebSearchEnd(WebSearchEndEvent {
                     call_id: call.call_id.clone(),
@@ -256,20 +261,26 @@ impl WebSearchTool {
             ))
             .await;
 
-        Ok(search_output(output, content))
+        Ok(output)
     }
 }
 
 async fn run_local_search(
     command: &OsStr,
     request: &SearchRequest,
+    images: bool,
 ) -> Result<(SearchResponse, Option<Vec<FunctionCallOutputContentItem>>), String> {
     use tokio::io::AsyncWriteExt;
 
     let name = command.to_string_lossy();
     let body = serde_json::to_vec(request).map_err(|err| format!("web.run request: {err}"))?;
-    let mut child = tokio::process::Command::new(command)
-        .env(WEB_RUN_IMAGES_ENV, "1")
+    let mut process = tokio::process::Command::new(command);
+    if images {
+        process.env(WEB_RUN_IMAGES_ENV, "1");
+    } else {
+        process.env_remove(WEB_RUN_IMAGES_ENV);
+    }
+    let mut child = process
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -365,19 +376,29 @@ fn is_inline_image(url: &str) -> bool {
     })
 }
 
-/// Chooses what the model gets: the content of an answer with images, and
+/// Chooses what the model gets, and the text that stands for it in the turn
+/// item: the content of an answer with images when the model takes images, and
 /// otherwise the text or the error as before.
 fn search_output(
     output: Result<String, String>,
     content: Option<Vec<FunctionCallOutputContentItem>>,
-) -> Box<dyn ToolOutput> {
+    supports_image_input: bool,
+) -> (Box<dyn ToolOutput>, String) {
     let images = match &output {
-        Ok(_) => content.and_then(ImageSearchOutput::new),
-        Err(_) => None,
+        Ok(_) if supports_image_input => content.and_then(ImageSearchOutput::new),
+        Ok(_) | Err(_) => None,
     };
     match images {
-        Some(images) => Box::new(images),
-        None => Box::new(SearchOutput::new(output)),
+        Some(images) => {
+            let shown = images.display_text();
+            (Box::new(images), shown)
+        }
+        None => {
+            let shown = match &output {
+                Ok(text) | Err(text) => text.clone(),
+            };
+            (Box::new(SearchOutput::new(output)), shown)
+        }
     }
 }
 
@@ -564,7 +585,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn local_command_is_told_that_content_is_accepted() {
+    async fn local_command_is_told_whether_images_are_taken() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().expect("temp dir");
@@ -573,7 +594,7 @@ mod tests {
             &command,
             concat!(
                 "#!/bin/sh\ncat >/dev/null\n",
-                r#"printf '{"encrypted_output":null,"output":"images=%s"}' "$CODEX_WEB_RUN_IMAGES""#,
+                r#"printf '{"encrypted_output":null,"output":"images=%s"}' "${CODEX_WEB_RUN_IMAGES-unset}""#,
                 "\n",
             ),
         )
@@ -590,11 +611,13 @@ mod tests {
             max_output_tokens: None,
         };
 
-        let (response, content) = run_local_search(command.as_os_str(), &request)
-            .await
-            .expect("the command's response");
-        assert_eq!(response.output, "images=1");
-        assert_eq!(content, None);
+        for (images, expected) in [(true, "images=1"), (false, "images=unset")] {
+            let (response, content) = run_local_search(command.as_os_str(), &request, images)
+                .await
+                .expect("the command's response");
+            assert_eq!(response.output, expected);
+            assert_eq!(content, None);
+        }
     }
 
     #[test]
@@ -646,32 +669,54 @@ mod tests {
             sent
         };
 
-        let content = vec![text("from content"), image.clone()];
-        let output = search_output(Ok("from output".to_string()), Some(content.clone()));
+        let content = vec![text("from content"), image.clone(), text(" after")];
+        let (output, shown) = search_output(
+            Ok("from output".to_string()),
+            Some(content.clone()),
+            /*supports_image_input*/ true,
+        );
         assert_eq!(
             output.code_mode_result(&payload),
-            json!(["from content", { "image_url": "data:image/png;base64,AAAA", "detail": "high" }])
+            json!([
+                "from content",
+                { "image_url": "data:image/png;base64,AAAA", "detail": "high" },
+                " after",
+            ])
         );
         assert_eq!(sent(output).content_items(), Some(content.as_slice()));
+        // The turn item names the image and holds none of its data.
+        assert_eq!(shown, "from content[image] after");
 
-        // Without an image, or without content, the text stands as before.
-        for content in [Some(vec![text("from content")]), None] {
-            let output = search_output(Ok("from output".to_string()), content);
+        // Without an image, without content, or for a model that takes no
+        // images, the text stands as before.
+        for (content, supports_image_input) in [
+            (Some(vec![text("from content")]), true),
+            (None, true),
+            (Some(content), false),
+        ] {
+            let (output, shown) =
+                search_output(Ok("from output".to_string()), content, supports_image_input);
             assert_eq!(output.code_mode_result(&payload), json!("from output"));
             assert_eq!(
                 sent(output).content_items(),
                 Some([text("from output")].as_slice())
             );
+            assert_eq!(shown, "from output");
         }
 
         // A failed call carries no content.
-        let output = search_output(Err("failed".to_string()), Some(vec![image]));
+        let (output, shown) = search_output(
+            Err("failed".to_string()),
+            Some(vec![image]),
+            /*supports_image_input*/ true,
+        );
         assert_eq!(output.code_mode_result(&payload), json!("failed"));
         let sent = sent(output);
         assert_eq!(
             (sent.text_content(), sent.success),
             (Some("failed"), Some(false))
         );
+        assert_eq!(shown, "failed");
     }
 
     #[test]

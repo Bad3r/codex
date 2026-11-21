@@ -47,6 +47,7 @@ use codex_tools::ToolExposure;
 use codex_tools::default_namespace_description;
 use http::HeaderMap;
 use http::HeaderValue;
+use serde::Deserialize;
 use url::Url;
 
 use crate::history::recent_input;
@@ -322,6 +323,20 @@ async fn run_local_search(
 
 const CONTENT_SHAPE_ERROR: &str = "content: expected a list of input_text items and input_image items with an inline data: image URL";
 
+/// What a local command adds to the service's SearchResponse.
+#[derive(Deserialize)]
+struct LocalContent {
+    #[serde(default)]
+    content: Option<Vec<LocalContentItem>>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum LocalContentItem {
+    InputText { text: String },
+    InputImage { image_url: String },
+}
+
 /// Reads a local command's answer: the service's SearchResponse and, when the
 /// answer carries `content`, the items the model gets in place of `output`.
 fn parse_local_response(
@@ -329,70 +344,50 @@ fn parse_local_response(
 ) -> Result<(SearchResponse, Option<Vec<FunctionCallOutputContentItem>>), String> {
     let response: SearchResponse = serde_json::from_slice(stdout).map_err(|err| err.to_string())?;
     // SearchResponse is the service's type and has no place for `content`, so a
-    // second pass reads it. An answer that pass cannot read is refused whole:
-    // dropping its content would turn an answer with images into one without.
-    let content = match serde_json::from_slice(stdout).map_err(|err| err.to_string())? {
-        serde_json::Value::Object(mut fields) => fields.remove("content"),
-        _ => None,
-    };
-    // The error names the shape and never the value, which may be image data.
+    // second pass reads that field alone. Its error names the shape and never
+    // the value, which may be image data.
+    let LocalContent { content } =
+        serde_json::from_slice(stdout).map_err(|_| CONTENT_SHAPE_ERROR.to_string())?;
     let content = content
-        .map(|content| parse_content(content).ok_or_else(|| CONTENT_SHAPE_ERROR.to_string()))
+        .map(|items| {
+            items
+                .into_iter()
+                .map(|item| match item {
+                    LocalContentItem::InputText { text } => {
+                        Some(FunctionCallOutputContentItem::InputText { text })
+                    }
+                    LocalContentItem::InputImage { image_url } => is_inline_image(&image_url)
+                        .then_some(FunctionCallOutputContentItem::InputImage {
+                            image: ImageReference::Inline { image_url },
+                            detail: Some(DEFAULT_IMAGE_DETAIL),
+                        }),
+                })
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| CONTENT_SHAPE_ERROR.to_string())
+        })
         .transpose()?;
     Ok((response, content))
 }
 
-fn parse_content(content: serde_json::Value) -> Option<Vec<FunctionCallOutputContentItem>> {
-    let serde_json::Value::Array(items) = content else {
-        return None;
-    };
-    items
-        .into_iter()
-        .map(|item| {
-            let serde_json::Value::Object(mut item) = item else {
-                return None;
-            };
-            let mut take = |key: &str| match item.remove(key) {
-                Some(serde_json::Value::String(value)) => Some(value),
-                _ => None,
-            };
-            match take("type")?.as_str() {
-                "input_text" => Some(FunctionCallOutputContentItem::InputText {
-                    text: take("text")?,
-                }),
-                "input_image" => {
-                    let image_url = take("image_url")?;
-                    is_inline_image(&image_url).then_some(
-                        FunctionCallOutputContentItem::InputImage {
-                            image: ImageReference::Inline { image_url },
-                            detail: Some(DEFAULT_IMAGE_DETAIL),
-                        },
-                    )
-                }
-                _ => None,
-            }
-        })
-        .collect()
-}
-
-/// Tells whether the URL is `data:image/<type>;base64,<data>` with base64 data.
+/// Tells whether the URL is `data:image/<type>;base64,<data>` for an image type
+/// the model takes, with padded base64 data.
 fn is_inline_image(url: &str) -> bool {
     let Some((head, data)) = url.split_once(',') else {
         return false;
     };
     let head = head.to_ascii_lowercase();
-    let Some(media_type) = head
+    let known_type = head
         .strip_prefix("data:image/")
         .and_then(|rest| rest.strip_suffix(";base64"))
-    else {
-        return false;
-    };
-    !media_type.is_empty()
-        && !data.is_empty()
+        .is_some_and(|media_type| matches!(media_type, "png" | "jpeg" | "gif" | "webp"));
+    let digits = data.trim_end_matches('=');
+    known_type
+        && !digits.is_empty()
         && data.len().is_multiple_of(4)
-        && data
+        && data.len() - digits.len() <= 2
+        && digits
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/'))
 }
 
 /// Chooses what the model gets, and the text that stands for it in the turn
@@ -592,9 +587,9 @@ mod tests {
     }
 
     #[test]
-    fn an_answer_the_content_pass_cannot_read_is_refused_whole() {
-        // Nested past the JSON parser's depth, the answer's content cannot be told
-        // from absent, so its images are not silently dropped.
+    fn fields_the_typed_parse_skips_do_not_disturb_the_content() {
+        // The service's parser skips unknown fields however deep they nest, and so
+        // does the content pass: the images beside such a field still arrive.
         let nested = |content: &str| {
             format!(
                 r#"{{"encrypted_output":null,"output":"page","extra":{}{}{content}}}"#,
@@ -602,16 +597,27 @@ mod tests {
                 "]".repeat(200)
             )
         };
-        for content in [
-            "",
-            r#","content":[{"type":"input_image","image_url":"data:image/png;base64,AAAA"}]"#,
-        ] {
-            assert!(
-                parse_local_response(nested(content).as_bytes())
-                    .is_err_and(|err| err.contains("recursion limit")),
-                "{content}"
-            );
-        }
+        let (response, content) =
+            parse_local_response(nested("").as_bytes()).expect("an answer without content");
+        assert_eq!((response.output.as_str(), content), ("page", None));
+        let image =
+            r#","content":[{"type":"input_image","image_url":"data:image/png;base64,AAAA"}]"#;
+        let (_, content) =
+            parse_local_response(nested(image).as_bytes()).expect("an answer with content");
+        assert_eq!(content.map(|items| items.len()), Some(1));
+    }
+
+    #[test]
+    fn a_repeated_content_field_is_refused() {
+        // Keeping the last one would let a valid list hide an invalid one.
+        let response = concat!(
+            r#"{"encrypted_output":null,"output":"page","content":"data:image/png;base64,AAAA","#,
+            r#""content":[{"type":"input_text","text":"page"}]}"#
+        );
+        assert_eq!(
+            parse_local_response(response.as_bytes()).map(|_| ()),
+            Err(CONTENT_SHAPE_ERROR.to_string())
+        );
     }
 
     #[cfg(unix)]
@@ -662,6 +668,11 @@ mod tests {
             r#"[{"type":"input_image","image_url":"data:image/png,AAAA"}]"#,
             r#"[{"type":"input_image","image_url":"data:image/png;base64,%%%%"}]"#,
             r#"[{"type":"input_image","image_url":"data:image/png;base64,AAA"}]"#,
+            r#"[{"type":"input_image","image_url":"data:image/png;base64,A=AA"}]"#,
+            r#"[{"type":"input_image","image_url":"data:image/png;base64,===="}]"#,
+            r#"[{"type":"input_image","image_url":"data:image/png;base64,A==="}]"#,
+            r#"[{"type":"input_image","image_url":"data:image/svg+xml;base64,AAAA"}]"#,
+            r#"[{"type":"input_image","image_url":"data:image/p ng;base64,AAAA"}]"#,
             r#"[{"type":"input_image","image_url":7}]"#,
             r#"[7]"#,
             r#"[{"type":"input_image","file_id":"file-1"}]"#,
@@ -670,7 +681,6 @@ mod tests {
             r#"[{"type":"input_text"}]"#,
             r#"["data:image/png;base64,AAAA"]"#,
             r#""data:image/png;base64,AAAA""#,
-            "null",
         ] {
             let response =
                 format!(r#"{{"encrypted_output":null,"output":"page","content":{content}}}"#);

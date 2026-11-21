@@ -65,10 +65,6 @@ const MAX_SEARCH_ERROR_BYTES: usize = 1024;
 // reads the SearchRequest JSON on stdin and prints a SearchResponse.
 const WEB_RUN_COMMAND_ENV: &str = "CODEX_WEB_RUN_COMMAND";
 const WEB_RUN_COMMAND_TIMEOUT: Duration = Duration::from_secs(180);
-// Set for the local command when the model takes images: its response may then
-// carry `content`, the items given to the model in place of `output`, so that an
-// answer can include images.
-const WEB_RUN_IMAGES_ENV: &str = "CODEX_WEB_RUN_IMAGES";
 
 fn local_command() -> Option<OsString> {
     std::env::var_os(WEB_RUN_COMMAND_ENV).filter(|value| !value.is_empty())
@@ -81,7 +77,6 @@ pub(crate) struct WebSearchTool {
     pub(crate) workspace_routing: Arc<WorkspaceRoutingContext>,
     pub(crate) settings: SearchSettings,
     pub(crate) supports_literature_search: bool,
-    pub(crate) supports_image_input: bool,
     pub(crate) originator: Option<String>,
 }
 
@@ -106,10 +101,8 @@ impl ToolExecutor for WebSearchTool {
                 description: WEB_RUN_DESCRIPTION.to_string(),
                 strict: false,
                 parameters,
-                // Only a local command's answer to a model that takes images can
-                // be anything but text.
-                output_schema: (self.supports_image_input && local_command().is_some())
-                    .then(|| code_mode_result_schema().into()),
+                // Only a local command's answer can be anything but text.
+                output_schema: local_command().map(|_| code_mode_result_schema().into()),
                 defer_loading: None,
             })],
         })
@@ -206,9 +199,7 @@ impl WebSearchTool {
             ))
             .await;
         let searched = match (&local_command, &client) {
-            (Some(command), _) => {
-                run_local_search(command, &request, self.supports_image_input).await
-            }
+            (Some(command), _) => run_local_search(command, &request).await,
             (None, Some(client)) => client
                 .search(&request, extra_headers)
                 .await
@@ -227,7 +218,7 @@ impl WebSearchTool {
             let payload_bytes = i64::try_from(payload.len()).unwrap_or(i64::MAX);
             let _ = metrics.histogram(RESULTS_PAYLOAD_BYTES_METRIC, payload_bytes, &[]);
         }
-        let (output, shown) = search_output(output, content, self.supports_image_input);
+        let (output, shown) = search_output(output, content);
         let legacy_action = match &command_action {
             WebSearchAction::Search { query, queries } => CoreWebSearchAction::Search {
                 query: query.clone(),
@@ -266,19 +257,12 @@ impl WebSearchTool {
 async fn run_local_search(
     command: &OsStr,
     request: &SearchRequest,
-    images: bool,
 ) -> Result<(SearchResponse, Option<Vec<FunctionCallOutputContentItem>>), String> {
     use tokio::io::AsyncWriteExt;
 
     let name = command.to_string_lossy();
     let body = serde_json::to_vec(request).map_err(|err| format!("web.run request: {err}"))?;
-    let mut process = tokio::process::Command::new(command);
-    if images {
-        process.env(WEB_RUN_IMAGES_ENV, "1");
-    } else {
-        process.env_remove(WEB_RUN_IMAGES_ENV);
-    }
-    let mut child = process
+    let mut child = tokio::process::Command::new(command)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -391,16 +375,15 @@ fn is_inline_image(url: &str) -> bool {
 }
 
 /// Chooses what the model gets, and the text that stands for it in the turn
-/// item: the content of an answer with images when the model takes images, and
-/// otherwise the text or the error as before.
+/// item: the content of an answer with images, and otherwise the text or the
+/// error as before.
 fn search_output(
     output: Result<String, String>,
     content: Option<Vec<FunctionCallOutputContentItem>>,
-    supports_image_input: bool,
 ) -> (Box<dyn ToolOutput>, String) {
     let images = match &output {
-        Ok(_) if supports_image_input => content.and_then(ImageSearchOutput::new),
-        Ok(_) | Err(_) => None,
+        Ok(_) => content.and_then(ImageSearchOutput::new),
+        Err(_) => None,
     };
     match images {
         Some(images) => {
@@ -528,7 +511,6 @@ mod tests {
     use super::command_action;
     use super::parse_commands;
     use super::parse_local_response;
-    use super::run_local_search;
     use super::search_error_message;
     use super::search_output;
     use super::search_request_headers;
@@ -620,43 +602,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn local_command_is_told_whether_images_are_taken() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempfile::tempdir().expect("temp dir");
-        let command = dir.path().join("web-run");
-        std::fs::write(
-            &command,
-            concat!(
-                "#!/bin/sh\ncat >/dev/null\n",
-                r#"printf '{"encrypted_output":null,"output":"images=%s"}' "${CODEX_WEB_RUN_IMAGES-unset}""#,
-                "\n",
-            ),
-        )
-        .expect("write the command");
-        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755))
-            .expect("make the command executable");
-        let request = codex_api::SearchRequest {
-            id: "session".to_string(),
-            model: "model".to_string(),
-            reasoning: None,
-            input: None,
-            commands: None,
-            settings: None,
-            max_output_tokens: None,
-        };
-
-        for (images, expected) in [(true, "images=1"), (false, "images=unset")] {
-            let (response, content) = run_local_search(command.as_os_str(), &request, images)
-                .await
-                .expect("the command's response");
-            assert_eq!(response.output, expected);
-            assert_eq!(content, None);
-        }
-    }
-
     #[test]
     fn local_response_content_rejects_anything_but_text_and_inline_images() {
         for content in [
@@ -717,11 +662,7 @@ mod tests {
         };
 
         let content = vec![text("from content"), image.clone(), text(" after")];
-        let (output, shown) = search_output(
-            Ok("from output".to_string()),
-            Some(content.clone()),
-            /*supports_image_input*/ true,
-        );
+        let (output, shown) = search_output(Ok("from output".to_string()), Some(content.clone()));
         assert_eq!(
             output.code_mode_result(&payload),
             json!([
@@ -734,15 +675,9 @@ mod tests {
         // The turn item names the image and holds none of its data.
         assert_eq!(shown, "from content[image] after");
 
-        // Without an image, without content, or for a model that takes no
-        // images, the text stands as before.
-        for (content, supports_image_input) in [
-            (Some(vec![text("from content")]), true),
-            (None, true),
-            (Some(content), false),
-        ] {
-            let (output, shown) =
-                search_output(Ok("from output".to_string()), content, supports_image_input);
+        // Without an image, or without content, the text stands as before.
+        for content in [Some(vec![text("from content")]), None] {
+            let (output, shown) = search_output(Ok("from output".to_string()), content);
             assert_eq!(output.code_mode_result(&payload), json!("from output"));
             assert_eq!(
                 sent(output).content_items(),
@@ -752,11 +687,7 @@ mod tests {
         }
 
         // A failed call carries no content.
-        let (output, shown) = search_output(
-            Err("failed".to_string()),
-            Some(vec![image]),
-            /*supports_image_input*/ true,
-        );
+        let (output, shown) = search_output(Err("failed".to_string()), Some(vec![image]));
         assert_eq!(output.code_mode_result(&payload), json!("failed"));
         let sent = sent(output);
         assert_eq!(

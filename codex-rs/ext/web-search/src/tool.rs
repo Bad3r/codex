@@ -1,4 +1,5 @@
 use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,6 +34,9 @@ use codex_login::default_client::create_transport_for_routes_async;
 use codex_model_provider::ACCOUNT_ROUTING_HEADER;
 use codex_model_provider::SharedModelProvider;
 use codex_model_provider::WorkspaceRoutingContext;
+use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
+use codex_protocol::models::FunctionCallOutputContentItem;
+use codex_protocol::models::ImageReference;
 use codex_protocol::models::WebSearchAction as CoreWebSearchAction;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::WebSearchBeginEvent;
@@ -46,6 +50,8 @@ use http::HeaderValue;
 use url::Url;
 
 use crate::history::recent_input;
+use crate::image_output::ImageSearchOutput;
+use crate::image_output::code_mode_result_schema;
 use crate::output::SearchOutput;
 use crate::schema::commands_schema;
 
@@ -58,6 +64,13 @@ const MAX_SEARCH_ERROR_BYTES: usize = 1024;
 // reads the SearchRequest JSON on stdin and prints a SearchResponse.
 const WEB_RUN_COMMAND_ENV: &str = "CODEX_WEB_RUN_COMMAND";
 const WEB_RUN_COMMAND_TIMEOUT: Duration = Duration::from_secs(180);
+// Set for the local command: its response may carry `content`, the items given
+// to the model in place of `output`, so that an answer can include images.
+const WEB_RUN_IMAGES_ENV: &str = "CODEX_WEB_RUN_IMAGES";
+
+fn local_command() -> Option<OsString> {
+    std::env::var_os(WEB_RUN_COMMAND_ENV).filter(|value| !value.is_empty())
+}
 
 pub(crate) struct WebSearchTool {
     pub(crate) session_id: String,
@@ -90,7 +103,8 @@ impl<'call> ToolExecutor<ToolCall<'call>> for WebSearchTool {
                 description: WEB_RUN_DESCRIPTION.to_string(),
                 strict: false,
                 parameters,
-                output_schema: None,
+                // Only a local command's answer can be anything but text.
+                output_schema: local_command().map(|_| code_mode_result_schema().into()),
                 defer_loading: None,
             })],
         })
@@ -119,7 +133,7 @@ impl WebSearchTool {
     ) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
         let commands = parse_commands(call.function_arguments()?, self.supports_literature_search)?;
         let command_action = command_action(&commands);
-        let local_command = std::env::var_os(WEB_RUN_COMMAND_ENV).filter(|value| !value.is_empty());
+        let local_command = local_command();
         let client = if local_command.is_some() {
             None
         } else {
@@ -194,12 +208,13 @@ impl WebSearchTool {
             (None, Some(client)) => client
                 .search(&request, extra_headers)
                 .await
+                .map(|response| (response, None))
                 .map_err(|err| err.to_string()),
             (None, None) => Err("web.run has no search backend".to_string()),
         };
-        let (output, results) = match searched {
-            Ok(response) => (Ok(response.output), response.results),
-            Err(err) => (Err(search_error_message(err)), None),
+        let (output, results, content) = match searched {
+            Ok((response, content)) => (Ok(response.output), response.results, content),
+            Err(err) => (Err(search_error_message(err)), None, None),
         };
         if let Some(results) = results.as_ref()
             && let Some(metrics) = codex_otel::global()
@@ -241,19 +256,20 @@ impl WebSearchTool {
             ))
             .await;
 
-        Ok(Box::new(SearchOutput::new(output)))
+        Ok(search_output(output, content))
     }
 }
 
 async fn run_local_search(
     command: &OsStr,
     request: &SearchRequest,
-) -> Result<SearchResponse, String> {
+) -> Result<(SearchResponse, Option<Vec<FunctionCallOutputContentItem>>), String> {
     use tokio::io::AsyncWriteExt;
 
     let name = command.to_string_lossy();
     let body = serde_json::to_vec(request).map_err(|err| format!("web.run request: {err}"))?;
     let mut child = tokio::process::Command::new(command)
+        .env(WEB_RUN_IMAGES_ENV, "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -293,7 +309,76 @@ async fn run_local_search(
         });
     }
     sent.map_err(|err| format!("{name}: {err}"))?;
-    serde_json::from_slice(&output.stdout).map_err(|err| format!("{name}: invalid response: {err}"))
+    parse_local_response(&output.stdout).map_err(|err| format!("{name}: invalid response: {err}"))
+}
+
+const CONTENT_SHAPE_ERROR: &str = "content: expected a list of input_text items and input_image items with an inline data: image URL";
+
+/// Reads a local command's answer: the service's SearchResponse and, when the
+/// answer carries `content`, the items the model gets in place of `output`.
+fn parse_local_response(
+    stdout: &[u8],
+) -> Result<(SearchResponse, Option<Vec<FunctionCallOutputContentItem>>), String> {
+    let response: SearchResponse = serde_json::from_slice(stdout).map_err(|err| err.to_string())?;
+    // SearchResponse is the service's type and has no place for `content`, so a
+    // second pass reads it; the first decides alone whether the answer is valid.
+    let content = match serde_json::from_slice::<serde_json::Value>(stdout) {
+        Ok(serde_json::Value::Object(mut fields)) => fields.remove("content"),
+        Ok(_) | Err(_) => None,
+    };
+    // The error names the shape and never the value, which may be image data.
+    let content = content
+        .map(|content| parse_content(&content).ok_or_else(|| CONTENT_SHAPE_ERROR.to_string()))
+        .transpose()?;
+    Ok((response, content))
+}
+
+fn parse_content(content: &serde_json::Value) -> Option<Vec<FunctionCallOutputContentItem>> {
+    content
+        .as_array()?
+        .iter()
+        .map(|item| match item.get("type")?.as_str()? {
+            "input_text" => Some(FunctionCallOutputContentItem::InputText {
+                text: item.get("text")?.as_str()?.to_string(),
+            }),
+            "input_image" => {
+                let image_url = item.get("image_url")?.as_str()?;
+                is_inline_image(image_url).then(|| FunctionCallOutputContentItem::InputImage {
+                    image: ImageReference::Inline {
+                        image_url: image_url.to_string(),
+                    },
+                    detail: Some(DEFAULT_IMAGE_DETAIL),
+                })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn is_inline_image(url: &str) -> bool {
+    const PREFIX: &str = "data:image/";
+    url.split_once(',').is_some_and(|(head, data)| {
+        !data.is_empty()
+            && head
+                .get(..PREFIX.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(PREFIX))
+    })
+}
+
+/// Chooses what the model gets: the content of an answer with images, and
+/// otherwise the text or the error as before.
+fn search_output(
+    output: Result<String, String>,
+    content: Option<Vec<FunctionCallOutputContentItem>>,
+) -> Box<dyn ToolOutput> {
+    let images = match &output {
+        Ok(_) => content.and_then(ImageSearchOutput::new),
+        Err(_) => None,
+    };
+    match images {
+        Some(images) => Box::new(images),
+        None => Box::new(SearchOutput::new(output)),
+    }
 }
 
 fn search_error_message(error: impl std::fmt::Display) -> String {
@@ -404,12 +489,190 @@ mod tests {
     use codex_extension_items::web_search::WebSearchAction;
     use pretty_assertions::assert_eq;
 
+    use super::CONTENT_SHAPE_ERROR;
     use super::command_action;
     use super::parse_commands;
+    use super::parse_local_response;
+    use super::run_local_search;
     use super::search_error_message;
+    use super::search_output;
     use super::search_request_headers;
     use codex_core::X_CODEX_TURN_METADATA_HEADER;
     use codex_extension_api::FunctionCallError;
+    use codex_extension_api::ToolOutput;
+    use codex_extension_api::ToolPayload;
+    use codex_protocol::models::FunctionCallOutputContentItem;
+    use codex_protocol::models::ImageDetail;
+    use codex_protocol::models::ImageReference;
+    use codex_protocol::models::ResponseInputItem;
+    use serde_json::json;
+
+    #[test]
+    fn local_response_content_carries_text_and_inline_images() {
+        let (response, content) = parse_local_response(
+            br#"{"encrypted_output":null,"output":"page","results":[],"content":[
+                {"type":"input_text","text":"page"},
+                {"type":"input_image","image_url":"data:image/png;base64,AAAA","detail":"low"},
+                {"type":"input_image","image_url":"DATA:image/jpeg;base64,BBBB"}
+            ]}"#,
+        )
+        .expect("a response with content");
+        assert_eq!(response.output, "page");
+        // The command's own detail is not taken: `low` would turn the image into a placeholder.
+        let image = |image_url: &str| FunctionCallOutputContentItem::InputImage {
+            image: ImageReference::Inline {
+                image_url: image_url.to_string(),
+            },
+            detail: Some(ImageDetail::High),
+        };
+        assert_eq!(
+            content,
+            Some(vec![
+                FunctionCallOutputContentItem::InputText {
+                    text: "page".to_string(),
+                },
+                image("data:image/png;base64,AAAA"),
+                image("DATA:image/jpeg;base64,BBBB"),
+            ])
+        );
+
+        let (response, content) =
+            parse_local_response(br#"{"encrypted_output":null,"output":"page"}"#)
+                .expect("a response without content");
+        assert_eq!(response.output, "page");
+        assert_eq!(content, None);
+    }
+
+    #[test]
+    fn local_response_without_content_is_read_as_before() {
+        // The typed parse alone decides: a repeated field still fails, and a field
+        // the second pass cannot read does not.
+        assert!(
+            parse_local_response(br#"{"encrypted_output":null,"output":"a","output":"b"}"#)
+                .is_err_and(|err| err.contains("duplicate field"))
+        );
+        let nested = format!(
+            r#"{{"encrypted_output":null,"output":"page","extra":{}{}}}"#,
+            "[".repeat(200),
+            "]".repeat(200)
+        );
+        let (response, content) =
+            parse_local_response(nested.as_bytes()).expect("deep ignored fields are skipped");
+        assert_eq!(response.output, "page");
+        assert_eq!(content, None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_command_is_told_that_content_is_accepted() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let command = dir.path().join("web-run");
+        std::fs::write(
+            &command,
+            concat!(
+                "#!/bin/sh\ncat >/dev/null\n",
+                r#"printf '{"encrypted_output":null,"output":"images=%s"}' "$CODEX_WEB_RUN_IMAGES""#,
+                "\n",
+            ),
+        )
+        .expect("write the command");
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755))
+            .expect("make the command executable");
+        let request = codex_api::SearchRequest {
+            id: "session".to_string(),
+            model: "model".to_string(),
+            reasoning: None,
+            input: None,
+            commands: None,
+            settings: None,
+            max_output_tokens: None,
+        };
+
+        let (response, content) = run_local_search(command.as_os_str(), &request)
+            .await
+            .expect("the command's response");
+        assert_eq!(response.output, "images=1");
+        assert_eq!(content, None);
+    }
+
+    #[test]
+    fn local_response_content_rejects_anything_but_text_and_inline_images() {
+        for content in [
+            r#"[{"type":"input_image","image_url":"https://example.com/page.png"}]"#,
+            r#"[{"type":"input_image","image_url":"data:text/html;base64,AAAA"}]"#,
+            r#"[{"type":"input_image","image_url":"data:image/png;base64"}]"#,
+            r#"[{"type":"input_image","image_url":"data:image/png;base64,"}]"#,
+            r#"[{"type":"input_image","file_id":"file-1"}]"#,
+            r#"[{"type":"input_audio","audio_url":"data:audio/wav;base64,AAAA"}]"#,
+            r#"[{"type":"encrypted_content","encrypted_content":"AAAA"}]"#,
+            r#"[{"type":"input_text"}]"#,
+            r#"["data:image/png;base64,AAAA"]"#,
+            r#""data:image/png;base64,AAAA""#,
+            "null",
+        ] {
+            let response =
+                format!(r#"{{"encrypted_output":null,"output":"page","content":{content}}}"#);
+            // The same words for every violation: none of the value reaches the model.
+            assert_eq!(
+                parse_local_response(response.as_bytes()).map(|_| ()),
+                Err(CONTENT_SHAPE_ERROR.to_string()),
+                "{content}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_answer_with_images_gives_the_model_its_content() {
+        let payload = ToolPayload::Function {
+            arguments: "{}".to_string(),
+        };
+        let text = |text: &str| FunctionCallOutputContentItem::InputText {
+            text: text.to_string(),
+        };
+        let image = FunctionCallOutputContentItem::InputImage {
+            image: ImageReference::Inline {
+                image_url: "data:image/png;base64,AAAA".to_string(),
+            },
+            detail: Some(ImageDetail::High),
+        };
+        let sent = |output: Box<dyn ToolOutput>| {
+            let ResponseInputItem::FunctionCallOutput { output: sent, .. } =
+                output.to_response_item("call-1", &payload)
+            else {
+                panic!("expected a function call output");
+            };
+            sent
+        };
+
+        let content = vec![text("from content"), image.clone()];
+        let output = search_output(Ok("from output".to_string()), Some(content.clone()));
+        assert_eq!(
+            output.code_mode_result(&payload),
+            json!(["from content", { "image_url": "data:image/png;base64,AAAA", "detail": "high" }])
+        );
+        assert_eq!(sent(output).content_items(), Some(content.as_slice()));
+
+        // Without an image, or without content, the text stands as before.
+        for content in [Some(vec![text("from content")]), None] {
+            let output = search_output(Ok("from output".to_string()), content);
+            assert_eq!(output.code_mode_result(&payload), json!("from output"));
+            assert_eq!(
+                sent(output).content_items(),
+                Some([text("from output")].as_slice())
+            );
+        }
+
+        // A failed call carries no content.
+        let output = search_output(Err("failed".to_string()), Some(vec![image]));
+        assert_eq!(output.code_mode_result(&payload), json!("failed"));
+        let sent = sent(output);
+        assert_eq!(
+            (sent.text_content(), sent.success),
+            (Some("failed"), Some(false))
+        );
+    }
 
     #[test]
     fn search_errors_preserve_short_messages_and_bound_utf8_output() {

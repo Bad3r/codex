@@ -96,9 +96,10 @@ impl App {
                 || "Thread ID unavailable.".to_string(),
                 |id| format!("Thread ID {id}"),
             );
+            self.transcript_view.jump_to_latest();
             self.chat_widget.add_info_message(
                 thread,
-                Some("Reconnect to send feedback or save a ZIP.".into()),
+                Some("Reconnect and retry /feedback.".into()),
             );
             return Ok(AppRunControl::Continue);
         }
@@ -1737,8 +1738,8 @@ impl App {
                 self.enqueue_thread_history_entry_response(thread_id, event)
                     .await?;
             }
-            AppEvent::DiffResult(cwd, text) => {
-                if &cwd != self.chat_widget.session_cwd() {
+            AppEvent::DiffResult { thread_id, cwd, text } => {
+                if thread_id != self.chat_widget.thread_id() || &cwd != self.chat_widget.session_cwd() {
                     return Ok(AppRunControl::Continue);
                 }
                 // Clear the in-progress state in the bottom pane

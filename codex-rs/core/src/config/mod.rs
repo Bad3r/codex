@@ -1850,6 +1850,12 @@ impl Config {
                 .enabled(Feature::GuardianNativeMultiAgentHistory)
     }
 
+    /// Both the reviewed thread and the reviewer must support encrypted agent history.
+    pub fn guardian_quotes_subagent_replies(&self, reviewer_provider_id: &str) -> bool {
+        self.guardian_native_multi_agent_history_enabled()
+            && reviewer_provider_id == OPENAI_PROVIDER_ID
+    }
+
     pub(crate) fn multi_agent_version_override(&self) -> Option<MultiAgentVersion> {
         if self.features.enabled(Feature::MultiAgentV2) {
             Some(MultiAgentVersion::V2)
@@ -4956,7 +4962,6 @@ impl Config {
                         version: realtime.version.unwrap_or(defaults.version),
                         session_type: realtime.session_type.unwrap_or(defaults.session_type),
                         transport: realtime.transport.unwrap_or(defaults.transport),
-                        voice: realtime.voice,
                     }
                 }),
             experimental_realtime_ws_backend_prompt: cfg.experimental_realtime_ws_backend_prompt,
@@ -5035,7 +5040,7 @@ impl Config {
                 .as_ref()
                 .map(|t| t.raw_output_mode)
                 .unwrap_or(false),
-            tui_collapse_turn_details: cfg.tui.as_ref().is_some_and(|tui| tui.collapse_turn_details),
+            tui_collapse_turn_details: cfg.tui.as_ref().is_none_or(|tui| tui.collapse_turn_details),
             tui_fullscreen_transcript: cfg
                 .tui
                 .as_ref()

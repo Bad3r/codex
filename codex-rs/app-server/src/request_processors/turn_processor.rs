@@ -216,16 +216,23 @@ impl TurnRequestProcessor {
             EnsureConversationListenerResult::Attached => {}
             EnsureConversationListenerResult::ConnectionClosed => return Ok(None),
         }
-        let result =
-            thread
-                .guardian_review(cancellation)
-                .await
-                .map_err(|err| match err.details() {
-                    CodexErrorDetails::InvalidRequest(message) => invalid_request(message.clone()),
-                    _ => internal_error(format!("Guardian review failed: {err}")),
-                })?;
+        // Older servers silently ignore rootEvidence. Acknowledge it on success so clients
+        // can distinguish a worker review from one that used only the injected history.
+        let used_root_evidence = params.root_evidence.is_some();
+        let result = thread
+            .guardian_review_with_root_evidence(
+                &params.tool_call,
+                params.root_evidence,
+                cancellation,
+            )
+            .await
+            .map_err(|err| match err.details() {
+                CodexErrorDetails::InvalidRequest(message) => invalid_request(message.clone()),
+                _ => internal_error(format!("Guardian review failed: {err}")),
+            })?;
         Ok(Some(
             ThreadGuardianReviewResponse {
+                used_root_evidence,
                 call_id: result.call_id,
                 assessment: ThreadGuardianAssessment {
                     outcome: result.assessment.outcome,

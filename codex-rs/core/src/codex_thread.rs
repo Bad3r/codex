@@ -4,6 +4,7 @@ use crate::agent::api::AgentControl;
 use crate::config::ConstraintResult;
 use crate::context::ContextualUserFragment;
 use crate::context::GuardianReviewEvidence;
+use crate::cyber_access_program::ContinuationCyberAccessProgram;
 use crate::elicitation::ElicitationRegistration;
 use crate::session::SessionIo;
 use crate::session::SessionSettingsUpdate;
@@ -946,6 +947,19 @@ impl CodexThread {
         task.turn_context.turn_metadata_state.root_turn_id()
     }
 
+    /// Returns the explicit program captured for continuations of the named active turn.
+    pub async fn active_turn_continuation_program(
+        &self,
+        expected_turn_id: &str,
+    ) -> Option<Arc<ContinuationCyberAccessProgram>> {
+        let active = self.session.active_turn.lock().await;
+        let task = active.as_ref()?.task.as_ref()?;
+        if task.turn_context.sub_id != expected_turn_id {
+            return None;
+        }
+        task.turn_context.extension_data.get()
+    }
+
     pub async fn set_app_server_client_info(
         &self,
         app_server_client_name: Option<String>,
@@ -1144,22 +1158,47 @@ impl CodexThread {
         Ok(())
     }
 
-    /// Review the final injected tool call without executing it.
+    /// Review the supplied tool call without executing it.
     pub async fn guardian_review(
         &self,
+        tool_call: &ResponseItem,
+        cancellation: &CancellationToken,
+    ) -> CodexResult<crate::guardian_review::GuardianReviewResult> {
+        self.guardian_review_with_root_evidence(
+            tool_call,
+            /*root_evidence*/ None,
+            cancellation,
+        )
+        .await
+    }
+
+    /// Use the supplied parent evidence only for this review of the injected history.
+    pub async fn guardian_review_with_root_evidence(
+        &self,
+        tool_call: &ResponseItem,
+        root_evidence: Option<codex_app_server_protocol::GuardianRootEvidence>,
         cancellation: &CancellationToken,
     ) -> CodexResult<crate::guardian_review::GuardianReviewResult> {
         if self.session.active_turn.lock().await.is_some() {
             return Err(CodexErr::InvalidRequest("thread has an active turn".into()));
         }
+        if root_evidence.is_some()
+            && (!self.config().await.ephemeral
+                || matches!(self.session_source(), SessionSource::SubAgent(_)))
+        {
+            return Err(CodexErr::InvalidRequest(
+                "recorded worker review requires an ephemeral non-subagent thread".into(),
+            ));
+        }
         let history = self.session.clone_history().await;
-        let tool_call = history.raw_items().next_back().cloned().ok_or_else(|| {
-            CodexErr::InvalidRequest(
-                "expected a final plaintext exec_command, apply_patch, request_permissions, or MCP call"
-                    .into(),
-            )
-        })?;
-        crate::guardian::review_tool_call(&self.session, history, &tool_call, cancellation).await
+        crate::guardian::review_tool_call(
+            &self.session,
+            history,
+            tool_call,
+            root_evidence,
+            cancellation,
+        )
+        .await
     }
 
     /// Inject raw Responses items. Plaintext agent-mail batches in a native MAv2
@@ -1412,6 +1451,13 @@ impl CodexThread {
             .await
     }
 
+    /// Captures local settings for thread views and input ownership checks.
+    /// The service tier is the configured selection. Use [`Self::config_snapshot`]
+    /// when the tier must be validated against the selected model.
+    pub async fn configured_snapshot(&self) -> ThreadConfigSnapshot {
+        self.session.configured_snapshot().await
+    }
+
     pub async fn config_snapshot(&self) -> ThreadConfigSnapshot {
         self.session.thread_config_snapshot().await
     }
@@ -1545,13 +1591,19 @@ impl CodexThread {
             .authorization_version(history.as_ref())
     }
 
-    /// Captures root originals and authorization before request-size preparation.
-    pub async fn guardian_root_snapshot(&self) -> Option<GuardianRootSnapshot> {
-        self.session
-            .services
-            .agent_control
-            .get_guardian_package(self.session.thread_id)
-            .await
+    /// Subscribes to coalesced committed changes to this runtime's Guardian evidence.
+    /// Release the watch borrow before calling Core or awaiting other work.
+    pub fn subscribe_guardian_evidence_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.thread_extension_data()
+            .get_or_init(GuardianReviewEvidence::default)
+            .changes
+            .subscribe()
+    }
+
+    /// Captures root originals and authorization before request-size preparation. A configured
+    /// host provider's failure is returned rather than treated as absent evidence.
+    pub async fn guardian_root_snapshot(&self) -> CodexResult<Option<GuardianRootSnapshot>> {
+        self.session.guardian_root_snapshot().await
     }
 
     /// Refresh the thread's layer-backed user config state from a caller-supplied

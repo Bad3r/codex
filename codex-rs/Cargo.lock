@@ -3632,7 +3632,7 @@ dependencies = [
 name = "codex-features"
 version = "0.0.0"
 dependencies = [
- "codex-network-proxy",
+ "codex-network-policy-types",
  "codex-protocol",
  "codex-utils-redacted-string",
  "pretty_assertions",
@@ -4577,6 +4577,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-network-policy-types"
+version = "0.0.0"
+dependencies = [
+ "schemars 0.8.22",
+ "serde",
+]
+
+[[package]]
 name = "codex-network-proxy"
 version = "0.0.0"
 dependencies = [
@@ -4586,6 +4594,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "clap",
+ "codex-network-policy-types",
  "codex-utils-absolute-path",
  "codex-utils-home-dir",
  "codex-utils-path-uri",
@@ -4798,7 +4807,7 @@ dependencies = [
  "codex-execpolicy-rules",
  "codex-extension-items",
  "codex-http-client",
- "codex-network-proxy",
+ "codex-network-policy-types",
  "codex-utils-absolute-path",
  "codex-utils-cached-str",
  "codex-utils-image",
@@ -5169,7 +5178,6 @@ dependencies = [
  "dunce",
  "futures",
  "insta",
- "opentelemetry_sdk",
  "pretty_assertions",
  "schemars 0.8.22",
  "serde",
@@ -5418,6 +5426,7 @@ dependencies = [
  "codex-shell-command",
  "codex-skills",
  "codex-state",
+ "codex-statsig",
  "codex-terminal-detection",
  "codex-uds",
  "codex-user-input",
@@ -5644,6 +5653,9 @@ version = "0.0.0"
 [[package]]
 name = "codex-utils-fuzzy-match"
 version = "0.0.0"
+dependencies = [
+ "nucleo",
+]
 
 [[package]]
 name = "codex-utils-git-discovery"

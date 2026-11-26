@@ -141,6 +141,7 @@ impl App {
                     | AppEvent::ConfirmDaemonUpdate(_)
                     | AppEvent::RunDaemonUpdate(_)
                     | AppEvent::InsertHistoryCell(_)
+                    | AppEvent::CompleteBackgroundCommand(_)
                     | AppEvent::CommitRealtimeTranscriptHistory
                     | AppEvent::ParkSideCompanion { .. }
                     | AppEvent::SideCreated { .. }
@@ -611,6 +612,9 @@ impl App {
                     app_server.cancel_older_history_page(thread_id, &cursor);
                     if self.chat_widget.thread_id() == Some(thread_id) {
                         self.transcript_view.history = TranscriptHistoryState::Failed;
+                        if self.transcript_reflow.refill_deadline.is_some() {
+                            self.transcript_reflow.schedule_immediate();
+                        }
                         if let Some(Overlay::Transcript(overlay)) = self.overlay.as_mut() {
                             overlay.set_history_state(TranscriptHistoryState::Failed);
                         }
@@ -758,13 +762,24 @@ impl App {
                         ));
                     }
                     Err(err)
-                        if err
-                            .downcast_ref::<crate::named_session_lookup::AmbiguousSessionName>()
-                            .is_some() =>
+                        if app_server.thread_params_mode() == crate::ThreadParamsMode::Cloud
+                            && matches!(
+                                err.downcast_ref::<TypedRequestError>(),
+                                Some(TypedRequestError::Server { method, source })
+                                    if method == "thread/read"
+                                        && source.message == "Open this cloud conversation before reading its transcript."
+                            ) =>
                     {
-                        self.chat_widget.add_error_message(err.to_string());
+                        self.chat_widget.add_error_message(
+                            "Run /resume without an ID and select the Cloud chat from the picker."
+                                .to_string(),
+                        );
                     }
-                    Err(err) => return Err(err),
+                    Err(err) => {
+                        if !self.recover_transport_error(&err) {
+                            self.chat_widget.add_error_message(err.to_string());
+                        }
+                    }
                 }
             }
             AppEvent::ResumeBackendSession(_)
@@ -1256,6 +1271,7 @@ impl App {
                 self.prepare_collab_history(app_server, cell.as_mut());
                 self.insert_history_cell(tui, cell);
             }
+            AppEvent::CompleteBackgroundCommand(cell) => self.complete_background_command(tui, cell),
             AppEvent::TurnTipReady { thread_id, turn_id } => {
                 self.turn_tips.ready(thread_id, &turn_id, self.transcript_cells.last());
                 tui.frame_requester().schedule_frame();

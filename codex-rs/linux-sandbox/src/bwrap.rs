@@ -65,6 +65,8 @@ pub(crate) const WSLG_DISTRO_ROOT: &str = "/mnt/wslg/distro";
 pub(crate) struct BwrapOptions {
     /// Whether to mount a fresh `/proc`; disabled by `--no-proc` or mount fallback.
     pub mount_proc: bool,
+    /// Enter the cwd used to resolve relative TMPDIR even if PWD names a hidden alias.
+    pub require_command_cwd: bool,
     /// Explicitly reuse the caller's PID namespace instead of creating one.
     pub inherit_pid_namespace: bool,
     /// How networking should be configured inside the bubblewrap sandbox.
@@ -85,6 +87,7 @@ impl Default for BwrapOptions {
     fn default() -> Self {
         Self {
             mount_proc: true,
+            require_command_cwd: false,
             inherit_pid_namespace: false,
             network_mode: BwrapNetworkMode::FullAccess,
             mask_wsl_interop: false,
@@ -331,24 +334,10 @@ fn create_bwrap_flags(
         preserved_files,
         synthetic_mount_targets,
     } = create_filesystem_args(file_system_sandbox_policy, sandbox_policy_cwd, options)?;
-    let normalized_command_cwd = normalize_command_cwd_for_bwrap(command_cwd);
     let mut args = Vec::new();
     args.push("--new-session".to_string());
     args.push("--die-with-parent".to_string());
     args.extend(filesystem_args);
-    if options.mask_wsl_interop {
-        // WSL's Windows-process bridge uses Unix sockets under /run/WSL.
-        // Mask them after all filesystem binds so network access cannot bypass
-        // the Linux filesystem policy by launching an unrestricted Windows process.
-        args.push("--tmpfs".to_string());
-        args.push(WSL_INTEROP_DIR.to_string());
-    }
-    if (options.mask_wsl_interop || options.mask_wslg_distro) && !options.mount_proc {
-        // Without a fresh procfs, the root bind retains the host procfs.
-        // Hide it so host process roots cannot restore the masked WSL views.
-        args.push("--tmpfs".to_string());
-        args.push("/proc".to_string());
-    }
     // Request a user namespace explicitly rather than relying on bubblewrap's
     // auto-enable behavior, which is skipped when the caller runs as uid 0.
     // This also blocks host procfs root/cwd/fd links through ptrace permission
@@ -361,12 +350,12 @@ fn create_bwrap_flags(
     if options.network_mode.should_unshare_network() {
         args.push("--unshare-net".to_string());
     }
-    // Mount a fresh /proc unless the caller explicitly disables it.
-    if options.mount_proc {
-        args.push("--proc".to_string());
-        args.push("/proc".to_string());
-    }
-    if normalized_command_cwd.as_path() != command_cwd {
+    let normalized_command_cwd = if options.require_command_cwd {
+        command_cwd.to_path_buf()
+    } else {
+        normalize_command_cwd_for_bwrap(command_cwd)
+    };
+    if options.require_command_cwd || normalized_command_cwd.as_path() != command_cwd {
         // Bubblewrap otherwise inherits the helper's logical cwd, which can be
         // a symlink alias that disappears once the sandbox only mounts
         // canonical roots. Enter the canonical command cwd explicitly so
@@ -484,6 +473,7 @@ fn create_filesystem_args(
     unreadable_roots.sort();
     unreadable_roots.dedup();
 
+    let mut synthetic_roots = Vec::new();
     let mut args = if resolved.has_full_disk_read_access {
         // Read-only root, then mount a minimal device tree.
         // In bubblewrap (`bubblewrap.c`, `SETUP_MOUNT_DEV`), `--dev /dev`
@@ -538,6 +528,7 @@ fn create_filesystem_args(
                 "/dev".to_string(),
             ];
         } else {
+            synthetic_roots.extend([Path::new("/dev"), Path::new("/")]);
             for root in readable_roots {
                 if !root.exists() {
                     continue;
@@ -554,6 +545,7 @@ fn create_filesystem_args(
                 } else {
                     root
                 };
+                synthetic_roots.retain(|path| !path.starts_with(&mount_root));
                 args.push("--ro-bind".to_string());
                 args.push(path_to_string(&mount_root));
                 args.push(path_to_string(&mount_root));
@@ -563,7 +555,8 @@ fn create_filesystem_args(
 
         args
     };
-    if args[0] == "--ro-bind" {
+    let restricted_reads = args[0] == "--tmpfs";
+    if !restricted_reads {
         append_daemon_socket_masks(&mut args, Path::new("/"), &daemon_directories)?;
     }
     let mut bwrap_args = BwrapArgs {
@@ -627,6 +620,7 @@ fn create_filesystem_args(
         let redundant_root_alias =
             binds_file_system_root && root != Path::new("/") && mount_root == Path::new("/");
         if !redundant_root_alias {
+            synthetic_roots.retain(|path| !path.starts_with(mount_root));
             bwrap_args.args.push("--bind".to_string());
             bwrap_args.args.push(path_to_string(mount_root));
             bwrap_args.args.push(path_to_string(mount_root));
@@ -779,6 +773,42 @@ fn create_filesystem_args(
         ]);
     }
 
+    // Directory deny masks are already sealed. A mask over / also hides /dev.
+    synthetic_roots.retain(|path| {
+        !unreadable_roots
+            .iter()
+            .any(|denied| path.starts_with(denied))
+    });
+    if options.mask_wsl_interop {
+        // WSL's Windows-process bridge uses Unix sockets under /run/WSL.
+        // Mask them after all filesystem binds so network access cannot bypass
+        // the Linux filesystem policy by launching an unrestricted Windows process.
+        bwrap_args.args.push("--tmpfs".to_string());
+        bwrap_args.args.push(WSL_INTEROP_DIR.to_string());
+        if restricted_reads {
+            synthetic_roots.push(Path::new(WSL_INTEROP_DIR));
+        }
+    }
+    if (options.mask_wsl_interop || options.mask_wslg_distro) && !options.mount_proc {
+        // Without a fresh procfs, the root bind retains the host procfs.
+        // Hide it so host process roots cannot restore the masked WSL views.
+        bwrap_args.args.push("--tmpfs".to_string());
+        bwrap_args.args.push("/proc".to_string());
+        if restricted_reads {
+            synthetic_roots.push(Path::new("/proc"));
+        }
+    }
+    // Mount a fresh /proc unless the caller explicitly disables it.
+    if options.mount_proc {
+        bwrap_args.args.push("--proc".to_string());
+        bwrap_args.args.push("/proc".to_string());
+    }
+    // Bubblewrap must finish creating mount points before sealing their backing
+    // directories. --remount-ro is nonrecursive, so writable child mounts survive.
+    for path in synthetic_roots {
+        bwrap_args.args.push("--remount-ro".to_string());
+        bwrap_args.args.push(path_to_string(path));
+    }
     Ok(bwrap_args)
 }
 

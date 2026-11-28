@@ -522,6 +522,7 @@ mod tests {
     use codex_protocol::models::ImageDetail;
     use codex_protocol::models::ImageReference;
     use codex_protocol::models::ResponseInputItem;
+    use codex_tools::CodeModeToolResult;
     use serde_json::json;
 
     #[test]
@@ -665,11 +666,11 @@ mod tests {
         let (output, shown) = search_output(Ok("from output".to_string()), Some(content.clone()));
         assert_eq!(
             output.code_mode_result(&payload),
-            json!([
+            CodeModeToolResult::from(json!([
                 "from content",
                 { "image_url": "data:image/png;base64,AAAA", "detail": "high" },
                 " after",
-            ])
+            ]))
         );
         assert_eq!(sent(output).content_items(), Some(content.as_slice()));
         // The turn item names the image and holds none of its data.
@@ -678,7 +679,10 @@ mod tests {
         // Without an image, or without content, the text stands as before.
         for content in [Some(vec![text("from content")]), None] {
             let (output, shown) = search_output(Ok("from output".to_string()), content);
-            assert_eq!(output.code_mode_result(&payload), json!("from output"));
+            assert_eq!(
+                output.code_mode_result(&payload),
+                CodeModeToolResult::from(json!("from output"))
+            );
             assert_eq!(
                 sent(output).content_items(),
                 Some([text("from output")].as_slice())
@@ -688,7 +692,10 @@ mod tests {
 
         // A failed call carries no content.
         let (output, shown) = search_output(Err("failed".to_string()), Some(vec![image]));
-        assert_eq!(output.code_mode_result(&payload), json!("failed"));
+        assert_eq!(
+            output.code_mode_result(&payload),
+            CodeModeToolResult::from(json!("failed"))
+        );
         let sent = sent(output);
         assert_eq!(
             (sent.text_content(), sent.success),

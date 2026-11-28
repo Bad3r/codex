@@ -4,6 +4,7 @@ use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ImageReference;
 use codex_protocol::models::ResponseInputItem;
+use codex_tools::CodeModeToolResult;
 use serde_json::Value as JsonValue;
 use serde_json::json;
 
@@ -90,8 +91,8 @@ impl ToolOutput for ImageSearchOutput {
 
     /// Code Mode scripts emit what they return, so the images stay apart from
     /// the text: each is an object the script passes to `image()`.
-    fn code_mode_result(&self, _payload: &ToolPayload) -> JsonValue {
-        JsonValue::Array(
+    fn code_mode_result(&self, _payload: &ToolPayload) -> CodeModeToolResult {
+        CodeModeToolResult::from(JsonValue::Array(
             self.items
                 .iter()
                 .filter_map(|item| match item {
@@ -110,7 +111,7 @@ impl ToolOutput for ImageSearchOutput {
                     | FunctionCallOutputContentItem::EncryptedContent { .. } => None,
                 })
                 .collect(),
-        )
+        ))
     }
 }
 
@@ -122,6 +123,7 @@ mod tests {
     use codex_protocol::models::ImageDetail;
     use codex_protocol::models::ImageReference;
     use codex_protocol::models::ResponseInputItem;
+    use codex_tools::CodeModeToolResult;
     use pretty_assertions::assert_eq;
     use serde_json::json;
 
@@ -174,12 +176,12 @@ mod tests {
 
         assert_eq!(
             output.code_mode_result(&payload),
-            json!([
+            CodeModeToolResult::from(json!([
                 "first page",
                 { "image_url": "data:image/png;base64,AAAA", "detail": "high" },
                 "second page",
                 { "image_url": "data:image/jpeg;base64,BBBB", "detail": "high" },
-            ])
+            ]))
         );
         assert!(output.contains_external_context());
         assert!(!output.log_output().contains("base64"));

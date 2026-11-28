@@ -4,6 +4,10 @@
 # `patched` and on a release candidate before it is published.
 set -euo pipefail
 
+if [[ -z ${GITHUB_ACTIONS:-} && -z ${IN_NIX_SHELL:-} ]] && command -v nix-shell >/dev/null; then
+  exec nix-shell -p pkg-config openssl.dev libcap.dev --run "$(printf '%q ' "$0" "$@")"
+fi
+
 cd "$(dirname "$0")/../../codex-rs"
 
 committed=$(mktemp)
